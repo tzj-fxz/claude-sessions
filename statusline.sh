@@ -196,156 +196,128 @@ if git rev-parse --git-dir >/dev/null 2>&1; then
   git_branch=$(git branch --show-current 2>/dev/null || git rev-parse --short HEAD 2>/dev/null)
 fi
 
-# ---- context window calculation (native) ----
+# ---- context window (native remaining_percentage, all users) ----
+# Claude Code provides context_window.remaining_percentage directly (may be null
+# before the first API response). Prefer it; fall back to a token calc; else "…".
 context_pct=""
 context_remaining_pct=""
 context_color() { if [ "$use_color" -eq 1 ]; then printf '\033[1;37m'; fi; }  # default white
 
 if [ "$HAS_JQ" -eq 1 ]; then
-  # Get context window size and current usage from native Claude Code input
-  CONTEXT_SIZE=$(echo "$input" | jq -r '.context_window.context_window_size // 200000' 2>/dev/null)
-  USAGE=$(echo "$input" | jq '.context_window.current_usage' 2>/dev/null)
+  cw_remaining=$(echo "$input" | jq -r '.context_window.remaining_percentage // empty' 2>/dev/null)
+else
+  cw_remaining=$(echo "$input" | grep -o '"remaining_percentage"[[:space:]]*:[[:space:]]*[0-9.]\+' | head -1 | grep -o '[0-9.]\+$')
+fi
 
-  if [ "$USAGE" != "null" ] && [ -n "$USAGE" ]; then
-    # Calculate current context from current_usage fields
-    # Formula: input_tokens + cache_creation_input_tokens + cache_read_input_tokens
-    CURRENT_TOKENS=$(echo "$USAGE" | jq '(.input_tokens // 0) + (.cache_creation_input_tokens // 0) + (.cache_read_input_tokens // 0)' 2>/dev/null)
-
+# Fallback: derive from current_usage tokens when remaining_percentage is absent
+if [ -z "$cw_remaining" ] || [ "$cw_remaining" = "null" ]; then
+  if [ "$HAS_JQ" -eq 1 ]; then
+    CONTEXT_SIZE=$(echo "$input" | jq -r '.context_window.context_window_size // 200000' 2>/dev/null)
+    CURRENT_TOKENS=$(echo "$input" | jq -r '(.context_window.current_usage // {}) | ((.input_tokens // 0) + (.cache_creation_input_tokens // 0) + (.cache_read_input_tokens // 0))' 2>/dev/null)
     if [ -n "$CURRENT_TOKENS" ] && [ "$CURRENT_TOKENS" -gt 0 ] 2>/dev/null; then
-      context_used_pct=$(( CURRENT_TOKENS * 100 / CONTEXT_SIZE ))
-      context_remaining_pct=$(( 100 - context_used_pct ))
-      # Clamp to valid range
-      (( context_remaining_pct < 0 )) && context_remaining_pct=0
-      (( context_remaining_pct > 100 )) && context_remaining_pct=100
-
-      # Set color based on remaining percentage
-      if [ "$context_remaining_pct" -le 20 ]; then
-        context_color() { if [ "$use_color" -eq 1 ]; then printf '\033[38;5;203m'; fi; }  # coral red
-      elif [ "$context_remaining_pct" -le 40 ]; then
-        context_color() { if [ "$use_color" -eq 1 ]; then printf '\033[38;5;215m'; fi; }  # peach
-      else
-        context_color() { if [ "$use_color" -eq 1 ]; then printf '\033[38;5;158m'; fi; }  # mint green
-      fi
-
-      context_pct="${context_remaining_pct}%"
+      cw_remaining=$(( 100 - CURRENT_TOKENS * 100 / CONTEXT_SIZE ))
     fi
   fi
 fi
 
-# ---- usage limit (from ratelimit-probe.sh cache) ----
+if [ -n "$cw_remaining" ] && [ "$cw_remaining" != "null" ]; then
+  context_remaining_pct=$(awk -v v="$cw_remaining" 'BEGIN{ if(v<0)v=0; if(v>100)v=100; printf "%d", v+0.5 }')
+  # Set color based on remaining percentage
+  if [ "$context_remaining_pct" -le 20 ]; then
+    context_color() { if [ "$use_color" -eq 1 ]; then printf '\033[38;5;203m'; fi; }  # coral red
+  elif [ "$context_remaining_pct" -le 40 ]; then
+    context_color() { if [ "$use_color" -eq 1 ]; then printf '\033[38;5;215m'; fi; }  # peach
+  else
+    context_color() { if [ "$use_color" -eq 1 ]; then printf '\033[38;5;158m'; fi; }  # mint green
+  fi
+  context_pct="${context_remaining_pct}%"
+fi
+
+# ---- usage limits (native rate_limits from stdin) ----
+# Claude Code provides rate_limits.{five_hour,seven_day} for Claude.ai subscribers
+# (Pro/Max) after the first API response. Each window may be independently absent,
+# and the whole object is absent for API-key users — in which case the segment is
+# simply hidden. No API probe, no OAuth token, no cache file needed.
 rl_session_txt=""; rl_session_pct=0; rl_session_bar=""
 rl_weekly_txt=""; rl_weekly_pct=0; rl_weekly_bar=""
-rl_status=""
 rl_color() { if [ "$use_color" -eq 1 ]; then printf '\033[38;5;158m'; fi; }  # default mint
 rl_weekly_color() { if [ "$use_color" -eq 1 ]; then printf '\033[38;5;153m'; fi; }  # default light blue
 
 CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-RATELIMIT_CACHE="$CLAUDE_DIR/ratelimit-cache.json"
-rl_error_msg=""
-rl_error_color() { if [ "$use_color" -eq 1 ]; then printf '\033[38;5;215m'; fi; }  # peach/warning
-if [ -f "$RATELIMIT_CACHE" ] && [ "$HAS_JQ" -eq 1 ]; then
-  rl_json=$(cat "$RATELIMIT_CACHE" 2>/dev/null)
-  rl_status=$(echo "$rl_json" | jq -r '.status // "unknown"' 2>/dev/null)
 
-  # Handle probe errors — show diagnostic hint in statusline
-  if [ "$rl_status" = "error" ]; then
-    rl_error_msg=$(echo "$rl_json" | jq -r '.errorMsg // "unknown error"' 2>/dev/null)
-  fi
+if [ "$HAS_JQ" -eq 1 ]; then
+  u5h=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty' 2>/dev/null)
+  r5h=$(echo "$input" | jq -r '.rate_limits.five_hour.resets_at // empty' 2>/dev/null)
+  u7d=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty' 2>/dev/null)
+  r7d=$(echo "$input" | jq -r '.rate_limits.seven_day.resets_at // empty' 2>/dev/null)
+else
+  # Pure-bash fallback. Each window object has no nested braces, so [^}]* is safe.
+  fh=$(echo "$input" | grep -o '"five_hour"[[:space:]]*:[[:space:]]*{[^}]*}')
+  u5h=$(echo "$fh" | grep -o '"used_percentage"[[:space:]]*:[[:space:]]*[0-9.]\+' | grep -o '[0-9.]\+$')
+  r5h=$(echo "$fh" | grep -o '"resets_at"[[:space:]]*:[[:space:]]*[0-9]\+' | grep -o '[0-9]\+$')
+  sd=$(echo "$input" | grep -o '"seven_day"[[:space:]]*:[[:space:]]*{[^}]*}')
+  u7d=$(echo "$sd" | grep -o '"used_percentage"[[:space:]]*:[[:space:]]*[0-9.]\+' | grep -o '[0-9.]\+$')
+  r7d=$(echo "$sd" | grep -o '"resets_at"[[:space:]]*:[[:space:]]*[0-9]\+' | grep -o '[0-9]\+$')
+fi
 
-  rl_reset=$(echo "$rl_json" | jq -r '.resetsAt // empty' 2>/dev/null)
-
-  # Session (5-hour) utilization
-  rl_s_util=$(echo "$rl_json" | jq -r '.session.utilization // empty' 2>/dev/null)
-  rl_s_reset=$(echo "$rl_json" | jq -r '.session.resetsAt // empty' 2>/dev/null)
-
-  if [ -n "$rl_s_util" ] && [ "$rl_s_util" != "null" ]; then
-    rl_session_pct=$(echo "$rl_s_util" | awk '{printf "%d", $1 * 100}')
-    rl_session_bar=$(progress_bar "$rl_session_pct" 10)
-    if [ -n "$rl_s_reset" ] && [ "$rl_s_reset" != "null" ]; then
-      now_sec=$(date +%s)
-      rl_s_reset_int=$(printf '%.0f' "$rl_s_reset")
-      rl_remaining=$(( rl_s_reset_int - now_sec ))
-      (( rl_remaining < 0 )) && rl_remaining=0
-      rl_rh=$(( rl_remaining / 3600 )); rl_rm=$(( (rl_remaining % 3600) / 60 ))
-      if [ "$sl_layout" = "full" ]; then
-        rl_session_txt="${rl_session_pct}% used, resets in ${rl_rh}h ${rl_rm}m"
-      else
-        rl_session_txt="${rl_session_pct}% ${rl_rh}h${rl_rm}m"
-      fi
+# Session (5-hour) window
+if [ -n "$u5h" ] && [ "$u5h" != "null" ]; then
+  rl_session_pct=$(awk -v v="$u5h" 'BEGIN{ if(v<0)v=0; printf "%d", v+0.5 }')
+  rl_session_bar=$(progress_bar "$rl_session_pct" 10)
+  if [ -n "$r5h" ] && [ "$r5h" != "null" ]; then
+    now_sec=$(date +%s); r5h_int=$(printf '%.0f' "$r5h")
+    rem=$(( r5h_int - now_sec )); (( rem < 0 )) && rem=0
+    rh=$(( rem / 3600 )); rmm=$(( (rem % 3600) / 60 ))
+    if [ "$rl_session_pct" -ge 100 ]; then
+      [ "$sl_layout" = "full" ] && rl_session_txt="LIMIT HIT, resets in ${rh}h ${rmm}m" || rl_session_txt="LIMIT ${rh}h${rmm}m"
+    elif [ "$sl_layout" = "full" ]; then
+      rl_session_txt="${rl_session_pct}% used, resets in ${rh}h ${rmm}m"
     else
-      if [ "$sl_layout" = "full" ]; then
-        rl_session_txt="${rl_session_pct}% used"
-      else
-        rl_session_txt="${rl_session_pct}%"
-      fi
+      rl_session_txt="${rl_session_pct}% ${rh}h${rmm}m"
     fi
-    # Color based on utilization
-    if [ "$rl_session_pct" -ge 90 ]; then
-      rl_color() { if [ "$use_color" -eq 1 ]; then printf '\033[38;5;203m'; fi; }  # coral red
-    elif [ "$rl_session_pct" -ge 70 ]; then
-      rl_color() { if [ "$use_color" -eq 1 ]; then printf '\033[38;5;215m'; fi; }  # peach
-    fi
+  else
+    [ "$sl_layout" = "full" ] && rl_session_txt="${rl_session_pct}% used" || rl_session_txt="${rl_session_pct}%"
   fi
-
-  # Rejected state (hit the limit)
-  if [ "$rl_status" = "rejected" ]; then
-    rl_session_pct=100
-    rl_session_bar=$(progress_bar 100 10)
-    if [ -n "$rl_reset" ] && [ "$rl_reset" != "null" ]; then
-      now_sec=$(date +%s)
-      rl_reset_int=$(printf '%.0f' "$rl_reset")
-      rl_remaining=$(( rl_reset_int - now_sec ))
-      (( rl_remaining < 0 )) && rl_remaining=0
-      rl_rh=$(( rl_remaining / 3600 )); rl_rm=$(( (rl_remaining % 3600) / 60 ))
-      if [ "$sl_layout" = "full" ]; then
-        rl_session_txt="LIMIT HIT, resets in ${rl_rh}h ${rl_rm}m"
-      else
-        rl_session_txt="LIMIT ${rl_rh}h${rl_rm}m"
-      fi
-    else
-      rl_session_txt="LIMIT HIT"
-    fi
+  if [ "$rl_session_pct" -ge 100 ]; then
     rl_color() { if [ "$use_color" -eq 1 ]; then printf '\033[1;38;5;203m'; fi; }  # bold red
+  elif [ "$rl_session_pct" -ge 90 ]; then
+    rl_color() { if [ "$use_color" -eq 1 ]; then printf '\033[38;5;203m'; fi; }  # coral red
+  elif [ "$rl_session_pct" -ge 70 ]; then
+    rl_color() { if [ "$use_color" -eq 1 ]; then printf '\033[38;5;215m'; fi; }  # peach
   fi
+fi
 
-  # Weekly (7-day) utilization
-  rl_w_util=$(echo "$rl_json" | jq -r '.weekly.utilization // empty' 2>/dev/null)
-  rl_w_reset=$(echo "$rl_json" | jq -r '.weekly.resetsAt // empty' 2>/dev/null)
-
-  if [ -n "$rl_w_util" ] && [ "$rl_w_util" != "null" ]; then
-    rl_weekly_pct=$(echo "$rl_w_util" | awk '{printf "%d", $1 * 100}')
-    rl_weekly_bar=$(progress_bar "$rl_weekly_pct" 10)
-    if [ -n "$rl_w_reset" ] && [ "$rl_w_reset" != "null" ]; then
-      now_sec=$(date +%s)
-      rl_w_reset_int=$(printf '%.0f' "$rl_w_reset")
-      rl_w_remaining=$(( rl_w_reset_int - now_sec ))
-      (( rl_w_remaining < 0 )) && rl_w_remaining=0
-      rl_wd=$(( rl_w_remaining / 86400 )); rl_wh=$(( (rl_w_remaining % 86400) / 3600 ))
-      if [ "$sl_layout" = "full" ]; then
-        rl_weekly_txt="${rl_weekly_pct}% used, resets in ${rl_wd}d ${rl_wh}h"
-      else
-        rl_weekly_txt="${rl_weekly_pct}% ${rl_wd}d${rl_wh}h"
-      fi
+# Weekly (7-day) window
+if [ -n "$u7d" ] && [ "$u7d" != "null" ]; then
+  rl_weekly_pct=$(awk -v v="$u7d" 'BEGIN{ if(v<0)v=0; printf "%d", v+0.5 }')
+  rl_weekly_bar=$(progress_bar "$rl_weekly_pct" 10)
+  if [ -n "$r7d" ] && [ "$r7d" != "null" ]; then
+    now_sec=$(date +%s); r7d_int=$(printf '%.0f' "$r7d")
+    rem=$(( r7d_int - now_sec )); (( rem < 0 )) && rem=0
+    wd=$(( rem / 86400 )); wh=$(( (rem % 86400) / 3600 ))
+    if [ "$rl_weekly_pct" -ge 100 ]; then
+      [ "$sl_layout" = "full" ] && rl_weekly_txt="LIMIT HIT, resets in ${wd}d ${wh}h" || rl_weekly_txt="LIMIT ${wd}d${wh}h"
+    elif [ "$sl_layout" = "full" ]; then
+      rl_weekly_txt="${rl_weekly_pct}% used, resets in ${wd}d ${wh}h"
     else
-      if [ "$sl_layout" = "full" ]; then
-        rl_weekly_txt="${rl_weekly_pct}% used"
-      else
-        rl_weekly_txt="${rl_weekly_pct}%"
-      fi
+      rl_weekly_txt="${rl_weekly_pct}% ${wd}d${wh}h"
     fi
-    if [ "$rl_weekly_pct" -ge 80 ]; then
-      rl_weekly_color() { if [ "$use_color" -eq 1 ]; then printf '\033[38;5;215m'; fi; }  # peach
-    fi
+  else
+    [ "$sl_layout" = "full" ] && rl_weekly_txt="${rl_weekly_pct}% used" || rl_weekly_txt="${rl_weekly_pct}%"
+  fi
+  if [ "$rl_weekly_pct" -ge 100 ]; then
+    rl_weekly_color() { if [ "$use_color" -eq 1 ]; then printf '\033[1;38;5;203m'; fi; }  # bold red
+  elif [ "$rl_weekly_pct" -ge 90 ]; then
+    rl_weekly_color() { if [ "$use_color" -eq 1 ]; then printf '\033[38;5;203m'; fi; }  # coral red
+  elif [ "$rl_weekly_pct" -ge 80 ]; then
+    rl_weekly_color() { if [ "$use_color" -eq 1 ]; then printf '\033[38;5;215m'; fi; }  # peach
   fi
 fi
 
 # ---- log extracted data ----
 {
-  echo "[$TIMESTAMP] Extracted: dir=${current_dir:-}, model=${model_name:-}, version=${model_version:-}, git=${git_branch:-}, context=${context_pct:-}, rl_status=${rl_status:-}, rl_session=${rl_session_pct:-}%, rl_weekly=${rl_weekly_pct:-}%"
+  echo "[$TIMESTAMP] Extracted: dir=${current_dir:-}, model=${model_name:-}, git=${git_branch:-}, ctx=${context_pct:-}, session=${rl_session_pct:-}%, weekly=${rl_weekly_pct:-}%"
   echo "[$TIMESTAMP] Width: term_cols=${term_cols} (source=${term_cols_src}) layout=${sl_layout}"
-  if [ "$HAS_JQ" -eq 0 ]; then
-    echo "[$TIMESTAMP] Note: Context, tokens, and session info require jq for full functionality"
-  fi
 } >> "$LOG_FILE" 2>/dev/null
 
 # ---- session label from cs tool ----
@@ -407,13 +379,11 @@ if [ -n "$context_pct" ]; then
     ctx_seg="🧠 $(context_color)Ctx: ${context_pct}$(rst)"
   fi
 else
-  ctx_seg="🧠 $(context_color)Ctx: TBD$(rst)"
+  ctx_seg="🧠 $(context_color)Ctx: …$(rst)"
 fi
 
 usage_seg=""
-if [ -n "$rl_error_msg" ]; then
-  usage_seg="⚠️ $(rl_error_color)Usage: ${rl_error_msg}$(rst)"
-elif [ -n "$rl_session_txt" ]; then
+if [ -n "$rl_session_txt" ]; then
   if [ "$sl_show_bars" -eq 1 ]; then
     usage_seg="⚡ $(rl_color)${sl_s_label}: ${rl_session_txt} [${rl_session_bar}]$(rst)"
   else

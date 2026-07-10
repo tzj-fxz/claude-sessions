@@ -475,7 +475,6 @@ def cmd_install(target_dir=None):
     cs_src = script_dir / "cs"
     cs_hook_src = script_dir / "cs-hook"
     statusline_src = script_dir / "statusline.sh"
-    ratelimit_probe_src = script_dir / "ratelimit-probe.sh"
 
     # When running from installed copy (~/bin), try to find source repo from metadata
     if not statusline_src.exists() and INSTALL_META.exists():
@@ -487,7 +486,6 @@ def cmd_install(target_dir=None):
                 cs_src = script_dir / "cs"
                 cs_hook_src = script_dir / "cs-hook"
                 statusline_src = script_dir / "statusline.sh"
-                ratelimit_probe_src = script_dir / "ratelimit-probe.sh"
         except Exception:
             pass
     if not statusline_src.exists():
@@ -543,13 +541,15 @@ def cmd_install(target_dir=None):
     _symlink_or_copy(statusline_src, sl_dst)
     installed_files["statusline.sh"] = str(sl_dst)
 
-    # Symlink ratelimit-probe.sh into chosen .claude dir
-    rl_dst = claude_dir / "ratelimit-probe.sh"
-    if ratelimit_probe_src.exists():
-        _symlink_or_copy(ratelimit_probe_src, rl_dst)
-        installed_files["ratelimit-probe.sh"] = str(rl_dst)
-    else:
-        print(f"{DIM}  ratelimit-probe.sh: not found, skipping{NC}")
+    # Clean up the retired ratelimit-probe.sh (superseded by native rate_limits in
+    # the statusline stdin). Remove any stale symlink/copy and its cache from prior installs.
+    for stale in (claude_dir / "ratelimit-probe.sh", claude_dir / "ratelimit-cache.json"):
+        try:
+            if stale.is_symlink() or stale.exists():
+                stale.unlink()
+                print(f"{DIM}  removed retired {stale.name}{NC}")
+        except OSError:
+            pass
 
     # Save install metadata for upgrade checks
     INSTALL_META.write_text(json.dumps({
@@ -597,27 +597,19 @@ def cmd_install(target_dir=None):
     else:
         print(f"{DIM}cs-hook already in PreToolUse hooks{NC}")
 
-    # Add ratelimit-probe.sh to PostToolUse hooks
-    if rl_dst.exists():
-        rl_probe_cmd = str(rl_dst)
-        post_tool = hooks.setdefault("PostToolUse", [])
-
-        catch_all_post = None
-        for entry in post_tool:
-            if entry.get("matcher", "") == "":
-                catch_all_post = entry
-                break
-        if catch_all_post is None:
-            catch_all_post = {"matcher": "", "hooks": []}
-            post_tool.append(catch_all_post)
-
-        post_hook_list = catch_all_post.setdefault("hooks", [])
-        already_rl = any(h.get("command", "").endswith("ratelimit-probe.sh") for h in post_hook_list)
-        if not already_rl:
-            post_hook_list.append({"type": "command", "command": rl_probe_cmd})
-            print(f"{GREEN}Added ratelimit-probe to PostToolUse hooks{NC}")
-        else:
-            print(f"{DIM}ratelimit-probe already in PostToolUse hooks{NC}")
+    # Remove any retired ratelimit-probe.sh PostToolUse hook left by prior installs,
+    # then drop emptied entries so we don't leave a dangling hook command behind.
+    post_tool = hooks.get("PostToolUse", [])
+    for entry in post_tool:
+        entry["hooks"] = [
+            h for h in entry.get("hooks", [])
+            if not h.get("command", "").endswith("ratelimit-probe.sh")
+        ]
+    post_tool = [e for e in post_tool if e.get("hooks")]
+    if post_tool:
+        hooks["PostToolUse"] = post_tool
+    else:
+        hooks.pop("PostToolUse", None)
 
     settings_file.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
     print(f"{GREEN}Updated {settings_file}{NC}")

@@ -60,19 +60,24 @@ Terminal width is detected in this order: `CS_STATUSLINE_WIDTH` override → `$C
 
 ### 3. Usage Limit Monitoring
 
-Real-time usage limits from the Anthropic API, displayed in the statusline:
+Usage limits displayed in the statusline, read straight from the data Claude Code
+already pipes to the statusline on stdin (`rate_limits`) — no API call, no OAuth
+token, no background hook:
 
 - **Session (5h)** — current 5-hour window utilization
 - **Weekly (7d)** — 7-day rolling utilization
-- Color-coded: mint (normal) → peach (>=70%) → red (>=90% or limit hit)
+- Color-coded: mint (normal) → peach (>=70%) → red (>=90%) → bold red (limit hit)
 
-A PostToolUse hook (`ratelimit-probe.sh`) makes a minimal background API call (1 Haiku token) every 2 minutes to fetch rate limit headers. If something goes wrong, the statusline shows actionable diagnostics:
+`rate_limits` is provided by Claude Code **only for Claude.ai subscribers (Pro/Max)**,
+and only after the first API response in a session; each window can be independently
+absent. When it isn't present (e.g. API-key auth, or very early in a session), the
+Session/Weekly segments are simply hidden — nothing to configure, nothing to fail.
 
-```
-⚠️ Usage: ~/.claude/.credentials.json not found. Log in: claude auth login
-⚠️ Usage: OAuth token expired. Try: claude auth logout && claude auth login
-⚠️ Usage: API request failed. Check network or proxy settings
-```
+> **Earlier versions** ran a `ratelimit-probe.sh` PostToolUse hook that made a
+> background Haiku API call to fetch rate-limit headers. That's gone — Claude Code
+> now surfaces the same numbers natively, so the probe, its OAuth token handling,
+> and the `ratelimit-cache.json` file were all removed. Re-running the installer
+> (or updating the plugin) cleans up the old hook and files automatically.
 
 ### 4. Smart Auto-labeling
 
@@ -101,9 +106,9 @@ Examples:
 /claude-sessions:setup
 ```
 
-Then **exit and restart Claude Code** — hooks only load on startup, so `ratelimit-probe` won't fire (and the Session/Weekly usage bars won't appear) until you restart.
+Then **exit and restart Claude Code** — the auto-labeling hook only loads on startup.
 
-The plugin auto-registers `cs-hook` and `ratelimit-probe.sh`. The `/claude-sessions:setup` slash command runs once to configure the statusline and symlink `cs` into `~/bin`.
+The plugin auto-registers `cs-hook`. The `/claude-sessions:setup` slash command runs once to configure the statusline and symlink `cs` into `~/bin`.
 
 **Upgrading** — Claude Code caches plugin files by version, so pulling a new commit isn't enough:
 
@@ -117,20 +122,18 @@ Then exit Claude Code (`exit` / Ctrl+D) and re-run `claude`. Verify in `/plugin`
 
 ## Troubleshooting
 
-**Statusline shows `Ctx` but not `Session` / `Weekly` usage bars.** The `ratelimit-probe.sh` PostToolUse hook hasn't populated `~/.claude/ratelimit-cache.json` yet. Common causes:
+**Statusline shows `Ctx` but not `Session` / `Weekly` usage.** `rate_limits` is only in the statusline input for **Claude.ai subscribers (Pro/Max)**, and only **after the first API response** in a session. Common cases:
 
-- You've only tested with `!cmd` shortcuts — those execute directly in a shell and **don't trigger tool hooks**. Send a normal prompt that makes Claude use a tool (e.g. "read README").
-- Claude Code wasn't restarted after installing/updating the plugin. Plugin hooks only register at startup.
-- The first probe has a 2-minute TTL; if the cache was just seeded, subsequent tool uses won't re-probe until 2 min elapse.
+- You authenticate with an **API key** (console billing) rather than a Pro/Max subscription — API-key usage has no 5h/7d windows, so these segments never appear. This is expected.
+- You just started the session and Claude hasn't made an API call yet — the segments appear once it does.
 
-Quick diagnostic:
+Quick check — see what Claude Code is actually handing the statusline:
 
 ```bash
-jq -r '.probeTime' ~/.claude/ratelimit-cache.json | xargs -I{} date -d @{} "+%F %T"
-date "+%F %T"
+echo '' | your-statusline-cmd    # or inspect: the input JSON has a top-level "rate_limits" object only for subscribers
 ```
 
-If `probeTime` lags the current time by more than a few minutes while you're actively using Claude Code with real tool calls, check `/plugin → Errors` for load errors.
+**`Ctx` shows `…`.** `context_window` is `null` before the first API response of a session; it fills in as soon as Claude makes a call.
 
 ---
 
@@ -148,10 +151,11 @@ Custom bin directory: `./cs install /usr/local/bin`
 
 ## Requirements
 
-- Python 3.6+
-- Linux (uses `/proc` filesystem)
-- `jq` (optional but recommended, for statusline JSON parsing)
-- `curl` (for usage limit probing)
+- Python 3.6+ — for the `cs` dashboard and auto-labeling
+- Linux (the `cs` dashboard uses the `/proc` filesystem)
+- `jq` — **optional**; the statusline parses its JSON with a pure-bash fallback when `jq` isn't on `PATH`
+
+The statusline itself has no other dependencies — usage limits come straight from Claude Code's statusline input, so there's no API call, OAuth token, or `curl` involved.
 
 ## Custom Claude config dir
 

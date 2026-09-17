@@ -46,17 +46,16 @@ if ! [[ "$term_cols" =~ ^[0-9]+$ ]] || [ "$term_cols" -le 0 ]; then
   term_cols=100; term_cols_src="fallback"
 fi
 
-# Layout: binary — full or compact. Previous 4-tier logic left narrow terminals
-# in edge cases where line 2 still got clipped. Compact is aggressive (drops
-# everything low-priority, splits Weekly to its own row) so it fits everywhere.
-# full    : "Session: 24% used, resets in 1h 12m [==--------]"  (all inline, bars)
-# compact : "S: 24% 1h12m" — short labels, no bars, Weekly on its own row,
-#           line 1 drops 🎨 style, 📟 version, and " (1M context)" suffix
-if [ "$term_cols" -ge 140 ]; then
-  sl_layout="full"
-else
-  sl_layout="compact"
-fi
+# Layout: width never costs you a segment. Each segment is built at three verbosity
+# tiers and packed into as many rows as the real width needs, so a split pane shows
+# the same segments a full-width window does — terser, and wrapped if necessary.
+#   tier 1: "Session: 24% used, resets in 1h 12m [==--------]"   (bars, long labels)
+#   tier 2: "Session: 24% used, 1h12m"                           (long labels, no bars)
+#   tier 3: "S: 24% 1h12m"                                       (short labels)
+# CS_STATUSLINE_MAX_ROWS is the row budget per group; the richest tier that fits in it
+# wins. If even tier 3 overflows the budget it wraps onto extra rows rather than clip.
+sl_max_rows="${CS_STATUSLINE_MAX_ROWS:-1}"
+[[ "$sl_max_rows" =~ ^[0-9]+$ ]] && [ "$sl_max_rows" -ge 1 ] || sl_max_rows=1
 
 # Get the directory where this statusline script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -238,8 +237,8 @@ fi
 # (Pro/Max) after the first API response. Each window may be independently absent,
 # and the whole object is absent for API-key users — in which case the segment is
 # simply hidden. No API probe, no OAuth token, no cache file needed.
-rl_session_txt=""; rl_session_pct=0; rl_session_bar=""
-rl_weekly_txt=""; rl_weekly_pct=0; rl_weekly_bar=""
+rl_session_t1=""; rl_session_t2=""; rl_session_t3=""; rl_session_pct=0; rl_session_bar=""
+rl_weekly_t1=""; rl_weekly_t2=""; rl_weekly_t3=""; rl_weekly_pct=0; rl_weekly_bar=""
 rl_color() { if [ "$use_color" -eq 1 ]; then printf '\033[38;5;158m'; fi; }  # default mint
 rl_weekly_color() { if [ "$use_color" -eq 1 ]; then printf '\033[38;5;153m'; fi; }  # default light blue
 
@@ -260,6 +259,89 @@ else
   r7d=$(echo "$sd" | grep -o '"resets_at"[[:space:]]*:[[:space:]]*[0-9]\+' | grep -o '[0-9]\+$')
 fi
 
+# Fingerprint of the *native* windows, taken before any cache fill below: this is what
+# tells us whether the cached per-model number can still be current.
+mu_fp="${u5h}|${r5h}|${u7d}|${r7d}"
+mu_fp_known=0
+if { [ -n "$u5h" ] && [ "$u5h" != "null" ]; } || { [ -n "$u7d" ] && [ "$u7d" != "null" ]; }; then
+  mu_fp_known=1
+fi
+
+# ---- usage-probe cache ----
+# Holds the per-model weekly bucket (Fable, Opus, ...), which is not on the statusline
+# stdin at all, plus copies of the session and all-model weekly windows. usage-probe.sh
+# reads all of it from the endpoint /usage uses; see the refresh decision further down.
+MODEL_USAGE_CACHE="$CLAUDE_DIR/model-usage-cache.json"
+MODEL_USAGE_MAX_AGE="${CS_USAGE_MAX_AGE:-1800}"             # ignore the cache past this age
+MODEL_USAGE_MIN_INTERVAL="${CS_USAGE_MIN_INTERVAL:-180}"    # floor between refreshes
+MODEL_USAGE_ERROR_BACKOFF="${CS_USAGE_ERROR_BACKOFF:-900}"  # slower retry after a failure
+mu_names=(); mu_pcts=(); mu_resets=()
+mu_note=""; mu_status=""; mu_seen=""; mu_age=-1; mu_need=0; mu_fresh=0
+mu_s_pct=""; mu_s_reset=""; mu_w_pct=""; mu_w_reset=""
+
+if [ "${CS_MODEL_USAGE:-1}" != "0" ] && [ -f "$MODEL_USAGE_CACHE" ]; then
+  mu_mtime=$(stat -c %Y "$MODEL_USAGE_CACHE" 2>/dev/null || stat -f %m "$MODEL_USAGE_CACHE" 2>/dev/null || echo 0)
+  mu_age=$(( $(date +%s) - mu_mtime ))
+  [ "$mu_age" -lt "$MODEL_USAGE_MAX_AGE" ] && mu_fresh=1
+  # One TSV record per line: "#" the cache's own state, "s"/"w" the session and
+  # all-model weekly windows, "m" a per-model bucket.
+  if [ "$HAS_JQ" -eq 1 ]; then
+    mu_rows=$(jq -r '["#", (.status // ""), (.seen // ""), (.errorMsg // "")],
+                     ["s", (.session.percent // ""), (.session.resetsAt // "")],
+                     ["w", (.weeklyAll.percent // ""), (.weeklyAll.resetsAt // "")],
+                     ((.models // [])[] | ["m", .name, (.percent // 0), (.resetsAt // 0)])
+                     | @tsv' "$MODEL_USAGE_CACHE" 2>/dev/null)
+  else
+    mu_rows=$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+print("#\t%s\t%s\t%s" % (d.get("status") or "", d.get("seen") or "", d.get("errorMsg") or ""))
+for key, tag in (("session", "s"), ("weeklyAll", "w")):
+    win = d.get(key) or {}
+    print("%s\t%s\t%s" % (tag, win.get("percent", ""), win.get("resetsAt", "")))
+for m in d.get("models") or []:
+    print("m\t%s\t%s\t%s" % (m.get("name") or "", m.get("percent") or 0, m.get("resetsAt") or 0))
+' "$MODEL_USAGE_CACHE" 2>/dev/null)
+  fi
+  while IFS=$'\t' read -r mu_k mu_a mu_b mu_c; do
+    case "$mu_k" in
+      '#')
+        mu_status="$mu_a"; mu_seen="$mu_b"
+        [ "$mu_status" = "ok" ] || mu_note="${mu_c:-$mu_status}"
+        ;;
+      s) [ "$mu_status" = "ok" ] && { mu_s_pct="$mu_a"; mu_s_reset="$mu_b"; } ;;
+      w) [ "$mu_status" = "ok" ] && { mu_w_pct="$mu_a"; mu_w_reset="$mu_b"; } ;;
+      m)
+        [ -n "$mu_a" ] || continue
+        [ "$mu_fresh" -eq 1 ] || continue
+        mu_names+=("$mu_a")
+        mu_pcts+=("$(awk -v v="$mu_b" 'BEGIN{ if(v<0)v=0; printf "%d", v+0.5 }')")
+        mu_resets+=("$mu_c")
+        ;;
+    esac
+  done <<< "$mu_rows"
+  [ "$mu_fresh" -eq 1 ] || mu_note="cache stale (${mu_age}s old)"
+fi
+
+# Claude Code omits rate_limits entirely until a window's first API response, so a
+# freshly opened terminal would show no Session/Weekly at all. The cache has both
+# numbers, so use them meanwhile — marked with ~ — and hand back to the native values
+# the moment they arrive.
+rl_s_cached=0; rl_w_cached=0
+if [ "$mu_fresh" -eq 1 ]; then
+  if { [ -z "$u5h" ] || [ "$u5h" = "null" ]; } && [ -n "$mu_s_pct" ]; then
+    u5h="$mu_s_pct"; r5h="$mu_s_reset"; rl_s_cached=1
+  fi
+  if { [ -z "$u7d" ] || [ "$u7d" = "null" ]; } && [ -n "$mu_w_pct" ]; then
+    u7d="$mu_w_pct"; r7d="$mu_w_reset"; rl_w_cached=1
+  fi
+fi
+rl_s_mark=""; [ "$rl_s_cached" -eq 1 ] && rl_s_mark="~"
+rl_w_mark=""; [ "$rl_w_cached" -eq 1 ] && rl_w_mark="~"
+
 # Session (5-hour) window
 if [ -n "$u5h" ] && [ "$u5h" != "null" ]; then
   rl_session_pct=$(awk -v v="$u5h" 'BEGIN{ if(v<0)v=0; printf "%d", v+0.5 }')
@@ -269,14 +351,22 @@ if [ -n "$u5h" ] && [ "$u5h" != "null" ]; then
     rem=$(( r5h_int - now_sec )); (( rem < 0 )) && rem=0
     rh=$(( rem / 3600 )); rmm=$(( (rem % 3600) / 60 ))
     if [ "$rl_session_pct" -ge 100 ]; then
-      [ "$sl_layout" = "full" ] && rl_session_txt="LIMIT HIT, resets in ${rh}h ${rmm}m" || rl_session_txt="LIMIT ${rh}h${rmm}m"
-    elif [ "$sl_layout" = "full" ]; then
-      rl_session_txt="${rl_session_pct}% used, resets in ${rh}h ${rmm}m"
+      rl_session_t1="${rl_s_mark}LIMIT HIT, resets in ${rh}h ${rmm}m"
+      rl_session_t2="${rl_s_mark}LIMIT HIT, ${rh}h${rmm}m"
+      rl_session_t3="${rl_s_mark}LIMIT ${rh}h${rmm}m"
     else
-      rl_session_txt="${rl_session_pct}% ${rh}h${rmm}m"
+      rl_session_t1="${rl_s_mark}${rl_session_pct}% used, resets in ${rh}h ${rmm}m"
+      rl_session_t2="${rl_s_mark}${rl_session_pct}% used, ${rh}h${rmm}m"
+      rl_session_t3="${rl_s_mark}${rl_session_pct}% ${rh}h${rmm}m"
     fi
   else
-    [ "$sl_layout" = "full" ] && rl_session_txt="${rl_session_pct}% used" || rl_session_txt="${rl_session_pct}%"
+    if [ "$rl_session_pct" -ge 100 ]; then
+      rl_session_t1="${rl_s_mark}LIMIT HIT"; rl_session_t2="$rl_session_t1"
+      rl_session_t3="${rl_s_mark}LIMIT"
+    else
+      rl_session_t1="${rl_s_mark}${rl_session_pct}% used"; rl_session_t2="$rl_session_t1"
+      rl_session_t3="${rl_s_mark}${rl_session_pct}%"
+    fi
   fi
   if [ "$rl_session_pct" -ge 100 ]; then
     rl_color() { if [ "$use_color" -eq 1 ]; then printf '\033[1;38;5;203m'; fi; }  # bold red
@@ -296,14 +386,22 @@ if [ -n "$u7d" ] && [ "$u7d" != "null" ]; then
     rem=$(( r7d_int - now_sec )); (( rem < 0 )) && rem=0
     wd=$(( rem / 86400 )); wh=$(( (rem % 86400) / 3600 ))
     if [ "$rl_weekly_pct" -ge 100 ]; then
-      [ "$sl_layout" = "full" ] && rl_weekly_txt="LIMIT HIT, resets in ${wd}d ${wh}h" || rl_weekly_txt="LIMIT ${wd}d${wh}h"
-    elif [ "$sl_layout" = "full" ]; then
-      rl_weekly_txt="${rl_weekly_pct}% used, resets in ${wd}d ${wh}h"
+      rl_weekly_t1="${rl_w_mark}LIMIT HIT, resets in ${wd}d ${wh}h"
+      rl_weekly_t2="${rl_w_mark}LIMIT HIT, ${wd}d${wh}h"
+      rl_weekly_t3="${rl_w_mark}LIMIT ${wd}d${wh}h"
     else
-      rl_weekly_txt="${rl_weekly_pct}% ${wd}d${wh}h"
+      rl_weekly_t1="${rl_w_mark}${rl_weekly_pct}% used, resets in ${wd}d ${wh}h"
+      rl_weekly_t2="${rl_w_mark}${rl_weekly_pct}% used, ${wd}d${wh}h"
+      rl_weekly_t3="${rl_w_mark}${rl_weekly_pct}% ${wd}d${wh}h"
     fi
   else
-    [ "$sl_layout" = "full" ] && rl_weekly_txt="${rl_weekly_pct}% used" || rl_weekly_txt="${rl_weekly_pct}%"
+    if [ "$rl_weekly_pct" -ge 100 ]; then
+      rl_weekly_t1="${rl_w_mark}LIMIT HIT"; rl_weekly_t2="$rl_weekly_t1"
+      rl_weekly_t3="${rl_w_mark}LIMIT"
+    else
+      rl_weekly_t1="${rl_w_mark}${rl_weekly_pct}% used"; rl_weekly_t2="$rl_weekly_t1"
+      rl_weekly_t3="${rl_w_mark}${rl_weekly_pct}%"
+    fi
   fi
   if [ "$rl_weekly_pct" -ge 100 ]; then
     rl_weekly_color() { if [ "$use_color" -eq 1 ]; then printf '\033[1;38;5;203m'; fi; }  # bold red
@@ -314,10 +412,48 @@ if [ -n "$u7d" ] && [ "$u7d" != "null" ]; then
   fi
 fi
 
+# ---- refresh the usage cache, event-driven ----
+# The native windows arrive free on every render and are always current, and nothing can
+# consume the per-model bucket without also moving them — so a request is only worth
+# making when their fingerprint changes. An idle session makes none at all; an active one
+# at most one per CS_USAGE_MIN_INTERVAL. When Claude Code has not reported any windows
+# yet we have no fingerprint to compare, so we fall back to plain staleness.
+if [ "${CS_MODEL_USAGE:-1}" != "0" ]; then
+  if [ ! -f "$MODEL_USAGE_CACHE" ]; then
+    mu_need=1
+  elif [ "$mu_status" != "ok" ]; then
+    [ "$mu_age" -ge "$MODEL_USAGE_ERROR_BACKOFF" ] && mu_need=1
+  elif [ "$mu_fp_known" -eq 0 ]; then
+    [ "$mu_age" -ge "$MODEL_USAGE_MAX_AGE" ] && mu_need=1
+  elif [ "$mu_seen" != "$mu_fp" ]; then
+    [ "$mu_age" -ge "$MODEL_USAGE_MIN_INTERVAL" ] && mu_need=1
+  fi
+
+  if [ "$mu_need" -eq 1 ]; then
+    # Find usage-probe.sh next to the *real* script: `cs install` symlinks this file
+    # into $CLAUDE_DIR, where SCRIPT_DIR alone would miss the probe.
+    sl_self="${BASH_SOURCE[0]}"
+    for _hop in 1 2 3 4 5; do
+      [ -L "$sl_self" ] || break
+      _link=$(readlink "$sl_self")
+      case "$_link" in
+        /*) sl_self="$_link" ;;
+        *)  sl_self="$(dirname "$sl_self")/$_link" ;;
+      esac
+    done
+    probe="$(cd "$(dirname "$sl_self")" 2>/dev/null && pwd)/usage-probe.sh"
+    [ -x "$probe" ] || probe="$SCRIPT_DIR/usage-probe.sh"
+    # Detach every fd: a background child still holding our stdout would keep Claude
+    # Code waiting on the pipe before it can draw the statusline.
+    [ -x "$probe" ] && ( CS_USAGE_FINGERPRINT="$mu_fp" "$probe" </dev/null >/dev/null 2>&1 & )
+  fi
+fi
+
 # ---- log extracted data ----
 {
   echo "[$TIMESTAMP] Extracted: dir=${current_dir:-}, model=${model_name:-}, git=${git_branch:-}, ctx=${context_pct:-}, session=${rl_session_pct:-}%, weekly=${rl_weekly_pct:-}%"
-  echo "[$TIMESTAMP] Width: term_cols=${term_cols} (source=${term_cols_src}) layout=${sl_layout}"
+  echo "[$TIMESTAMP] Usage cache: ${#mu_names[@]} model bucket(s)${mu_names[0]:+ (${mu_names[0]} ${mu_pcts[0]}%)} status=${mu_status:-none} age=${mu_age}s refresh=${mu_need} fp_known=${mu_fp_known} filled=s${rl_s_cached}/w${rl_w_cached}${mu_note:+ note=${mu_note}}"
+  echo "[$TIMESTAMP] Width: term_cols=${term_cols} (source=${term_cols_src}) max_rows=${sl_max_rows}"
 } >> "$LOG_FILE" 2>/dev/null
 
 # ---- session label from cs tool ----
@@ -333,85 +469,181 @@ if [ -f "$CS_LABELS_FILE" ] && [ -n "$session_id" ]; then
 fi
 
 # ---- render statusline ----
-# Line 1: Core info (directory, git, model, claude code version, output style)
-if [ -n "$session_label" ]; then
-  printf '🏷️ %s%s%s  ' "$(label_color)" "$session_label" "$(rst)"
-fi
-printf '📁 %s%s%s' "$(dir_color)" "$current_dir" "$(rst)"
-if [ -n "$git_branch" ]; then
-  printf '  🌿 %s%s%s' "$(git_color)" "$git_branch" "$(rst)"
-fi
-# In compact, drop " (1M context)" suffix and the two lowest-priority segments
-# (cc_version, output_style) so line 1 never exceeds a narrow terminal.
-model_display="$model_name"
-[ "$sl_layout" = "compact" ] && model_display="${model_display% (1M context)}"
-printf '  🤖 %s%s%s' "$(model_color)" "$model_display" "$(rst)"
+# Build every segment once at three verbosity tiers, then pack them into rows that fit
+# the real terminal width. Two groups: 1 = identity (label, dir, branch, model, version,
+# style), 2 = usage (context, session, weekly, per-model weekly). Width no longer costs
+# a segment — a narrow pane gets a terser tier, and extra rows if it still doesn't fit.
+SEP="  "
+RESET_SEQ=$(rst)   # resolved once; add_seg runs for every segment at every tier
+seg_group=(); seg_c1=(); seg_c2=(); seg_c3=(); seg_p1=(); seg_p2=(); seg_p3=()
+
+add_seg() { # group icon color-fn text_tier1 text_tier2 text_tier3
+  local g="$1" icon="$2" cfn="$3" t1="$4" t2="$5" t3="$6" col
+  col=$($cfn)
+  seg_group+=("$g")
+  seg_p1+=("$icon $t1"); seg_c1+=("$icon ${col}${t1}${RESET_SEQ}")
+  seg_p2+=("$icon $t2"); seg_c2+=("$icon ${col}${t2}${RESET_SEQ}")
+  seg_p3+=("$icon $t3"); seg_c3+=("$icon ${col}${t3}${RESET_SEQ}")
+}
+
+# --- group 1: identity ---
+[ -n "$session_label" ] && add_seg 1 "🏷️" label_color "$session_label" "$session_label" "$session_label"
+add_seg 1 "📁" dir_color "$current_dir" "$current_dir" "$current_dir"
+[ -n "$git_branch" ] && add_seg 1 "🌿" git_color "$git_branch" "$git_branch" "$git_branch"
+# The " (1M context)" suffix is worth abbreviating, not dropping.
+model_terse="${model_name/ (1M context)/ (1M)}"
+add_seg 1 "🤖" model_color "$model_name" "$model_name" "$model_terse"
 if [ -n "$model_version" ] && [ "$model_version" != "null" ]; then
-  printf '  🏷️ %s%s%s' "$(version_color)" "$model_version" "$(rst)"
+  add_seg 1 "🏷️" version_color "$model_version" "$model_version" "$model_version"
 fi
-if [ -n "$cc_version" ] && [ "$cc_version" != "null" ] && [ "$sl_layout" = "full" ]; then
-  printf '  📟 %sv%s%s' "$(cc_version_color)" "$cc_version" "$(rst)"
+if [ -n "$cc_version" ] && [ "$cc_version" != "null" ]; then
+  add_seg 1 "📟" cc_version_color "v$cc_version" "v$cc_version" "v$cc_version"
 fi
-if [ -n "$output_style" ] && [ "$output_style" != "null" ] && [ "$sl_layout" = "full" ]; then
-  printf '  🎨 %s%s%s' "$(style_color)" "$output_style" "$(rst)"
-fi
-
-# Lines 2+: Context and usage limits.
-# - full:    single row with Ctx + Session + Weekly and progress bars
-# - compact: short labels, no bars, Weekly on its own row
-if [ "$sl_layout" = "full" ]; then
-  sl_show_bars=1
-  sl_s_label="Session"
-  sl_w_label="Weekly"
-else
-  sl_show_bars=0
-  sl_s_label="S"
-  sl_w_label="W"
+if [ -n "$output_style" ] && [ "$output_style" != "null" ]; then
+  add_seg 1 "🎨" style_color "$output_style" "$output_style" "$output_style"
 fi
 
-# Build each segment independently so we can recombine across rows.
-ctx_seg=""
+# --- group 2: context and usage limits ---
 if [ -n "$context_pct" ]; then
-  if [ "$sl_show_bars" -eq 1 ]; then
-    context_bar=$(progress_bar "$context_remaining_pct" 10)
-    ctx_seg="🧠 $(context_color)Ctx: ${context_pct} [${context_bar}]$(rst)"
-  else
-    ctx_seg="🧠 $(context_color)Ctx: ${context_pct}$(rst)"
-  fi
+  add_seg 2 "🧠" context_color \
+    "Ctx: ${context_pct} [$(progress_bar "$context_remaining_pct" 10)]" \
+    "Ctx: ${context_pct}" "Ctx: ${context_pct}"
 else
-  ctx_seg="🧠 $(context_color)Ctx: …$(rst)"
+  add_seg 2 "🧠" context_color "Ctx: …" "Ctx: …" "Ctx: …"
 fi
 
-usage_seg=""
-if [ -n "$rl_session_txt" ]; then
-  if [ "$sl_show_bars" -eq 1 ]; then
-    usage_seg="⚡ $(rl_color)${sl_s_label}: ${rl_session_txt} [${rl_session_bar}]$(rst)"
+if [ -n "$rl_session_t1" ]; then
+  add_seg 2 "⚡" rl_color "Session: ${rl_session_t1} [${rl_session_bar}]" \
+    "Session: ${rl_session_t2}" "S: ${rl_session_t3}"
+fi
+
+if [ -n "$rl_weekly_t1" ]; then
+  # Once a per-model bucket sits next to it, the 7d total has to say it is the total —
+  # "Weekly" alone reads as if it were the only weekly number.
+  sl_w_label="Weekly"; sl_w_short="W"
+  if [ "${#mu_names[@]}" -gt 0 ]; then sl_w_label="Weekly(all)"; sl_w_short="W(all)"; fi
+  add_seg 2 "📊" rl_weekly_color "${sl_w_label}: ${rl_weekly_t1} [${rl_weekly_bar}]" \
+    "${sl_w_label}: ${rl_weekly_t2}" "${sl_w_short}: ${rl_weekly_t3}"
+fi
+
+# Per-model weekly buckets, usually just one (Fable).
+mu_i=0
+while [ "$mu_i" -lt "${#mu_names[@]}" ]; do
+  mu_name="${mu_names[$mu_i]}"; mu_pct="${mu_pcts[$mu_i]}"; mu_reset="${mu_resets[$mu_i]}"
+  mu_i=$(( mu_i + 1 ))
+
+  mu_color() { if [ "$use_color" -eq 1 ]; then printf '\033[38;5;183m'; fi; }  # light violet
+  if [ "$mu_pct" -ge 100 ]; then
+    mu_color() { if [ "$use_color" -eq 1 ]; then printf '\033[1;38;5;203m'; fi; }  # bold red
+  elif [ "$mu_pct" -ge 90 ]; then
+    mu_color() { if [ "$use_color" -eq 1 ]; then printf '\033[38;5;203m'; fi; }  # coral red
+  elif [ "$mu_pct" -ge 80 ]; then
+    mu_color() { if [ "$use_color" -eq 1 ]; then printf '\033[38;5;215m'; fi; }  # peach
+  fi
+
+  if [ "$mu_pct" -ge 100 ]; then
+    mu_t1="LIMIT HIT"; mu_t2="LIMIT HIT"; mu_t3="LIMIT"
   else
-    usage_seg="⚡ $(rl_color)${sl_s_label}: ${rl_session_txt}$(rst)"
+    mu_t1="${mu_pct}% used"; mu_t2="${mu_pct}% used"; mu_t3="${mu_pct}%"
+  fi
+
+  # The reset time is only worth the width when it differs from the 7d total's —
+  # per-model buckets normally roll over with it.
+  if [[ "$mu_reset" =~ ^[0-9]+$ ]] && [ "$mu_reset" -gt 0 ]; then
+    mu_r7d=0
+    [[ "$r7d" =~ ^[0-9]+$ ]] && mu_r7d="$r7d"
+    mu_delta=$(( mu_reset - mu_r7d )); [ "$mu_delta" -lt 0 ] && mu_delta=$(( -mu_delta ))
+    if [ "$mu_delta" -gt 300 ]; then
+      mu_rem=$(( mu_reset - $(date +%s) )); [ "$mu_rem" -lt 0 ] && mu_rem=0
+      mu_d=$(( mu_rem / 86400 )); mu_h=$(( (mu_rem % 86400) / 3600 ))
+      mu_t1="${mu_t1}, resets in ${mu_d}d ${mu_h}h"
+      mu_t2="${mu_t2}, ${mu_d}d${mu_h}h"
+      mu_t3="${mu_t3} ${mu_d}d${mu_h}h"
+    fi
+  fi
+
+  add_seg 2 "🎭" mu_color "${mu_name}: ${mu_t1} [$(progress_bar "$mu_pct" 10)]" \
+    "${mu_name}: ${mu_t2}" "${mu_name}: ${mu_t3}"
+done
+
+# --- display width of each tier ---
+# python3 measures it properly (CJK session labels and emoji are double-width). Without
+# python3 we count bytes, which over-estimates multibyte text and so wraps early rather
+# than clipping — the safe direction to be wrong in.
+seg_w1=(); seg_w2=(); seg_w3=()
+if [ "${#seg_group[@]}" -gt 0 ]; then
+  seg_widths=""
+  if command -v python3 >/dev/null 2>&1; then
+    seg_widths=$(printf '%s\n' "${seg_p1[@]}" "${seg_p2[@]}" "${seg_p3[@]}" | python3 -c '
+import sys, unicodedata
+def width(s):
+    n = 0
+    for ch in s:
+        if unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+            continue
+        o = ord(ch)
+        if (unicodedata.east_asian_width(ch) in ("W", "F")
+                or 0x1F300 <= o <= 0x1FAFF or 0x2600 <= o <= 0x27BF):
+            n += 2
+        else:
+            n += 1
+    return n
+for line in sys.stdin.read().splitlines():
+    print(width(line))
+' 2>/dev/null)
+  fi
+  seg_n=${#seg_group[@]}
+  if [ -n "$seg_widths" ]; then
+    seg_i=0
+    while IFS= read -r seg_wv; do
+      if [ "$seg_i" -lt "$seg_n" ]; then seg_w1+=("$seg_wv")
+      elif [ "$seg_i" -lt $(( 2 * seg_n )) ]; then seg_w2+=("$seg_wv")
+      else seg_w3+=("$seg_wv"); fi
+      seg_i=$(( seg_i + 1 ))
+    done <<< "$seg_widths"
+  fi
+  if [ "${#seg_w3[@]}" -ne "$seg_n" ]; then
+    seg_w1=(); seg_w2=(); seg_w3=()
+    for (( seg_i=0; seg_i<seg_n; seg_i++ )); do
+      seg_w1+=("$(printf '%s' "${seg_p1[$seg_i]}" | wc -c | tr -d ' ')")
+      seg_w2+=("$(printf '%s' "${seg_p2[$seg_i]}" | wc -c | tr -d ' ')")
+      seg_w3+=("$(printf '%s' "${seg_p3[$seg_i]}" | wc -c | tr -d ' ')")
+    done
   fi
 fi
 
-weekly_seg=""
-if [ -n "$rl_weekly_txt" ]; then
-  if [ "$sl_show_bars" -eq 1 ]; then
-    weekly_seg="📊 $(rl_weekly_color)${sl_w_label}: ${rl_weekly_txt} [${rl_weekly_bar}]$(rst)"
-  else
-    weekly_seg="📊 $(rl_weekly_color)${sl_w_label}: ${rl_weekly_txt}$(rst)"
-  fi
-fi
+# --- pack a group into rows of at most term_cols columns ---
+pack_rows=()
+pack_group() { # group tier
+  pack_rows=()
+  local cur="" curw=0 i seg w
+  for (( i=0; i<${#seg_group[@]}; i++ )); do
+    [ "${seg_group[$i]}" = "$1" ] || continue
+    case "$2" in
+      1) seg="${seg_c1[$i]}"; w="${seg_w1[$i]}" ;;
+      2) seg="${seg_c2[$i]}"; w="${seg_w2[$i]}" ;;
+      *) seg="${seg_c3[$i]}"; w="${seg_w3[$i]}" ;;
+    esac
+    [[ "$w" =~ ^[0-9]+$ ]] || w=${#seg}
+    if [ -z "$cur" ]; then
+      cur="$seg"; curw="$w"
+    elif [ $(( curw + 2 + w )) -le "$term_cols" ]; then
+      cur="${cur}${SEP}${seg}"; curw=$(( curw + 2 + w ))
+    else
+      pack_rows+=("$cur"); cur="$seg"; curw="$w"
+    fi
+  done
+  [ -n "$cur" ] && pack_rows+=("$cur")
+}
 
-# Compose rows: one row in full/tight/compact; split Weekly to its own row in minimal.
-line2="$ctx_seg"
-[ -n "$usage_seg" ] && line2="${line2}  ${usage_seg}"
+render_group() { # group — print the richest tier that stays within the row budget
+  local tier
+  for tier in 1 2 3; do
+    pack_group "$1" "$tier"
+    [ "${#pack_rows[@]}" -le "$sl_max_rows" ] && break
+  done
+  [ "${#pack_rows[@]}" -gt 0 ] && printf '%s\n' "${pack_rows[@]}"
+}
 
-line3=""
-if [ "$sl_layout" = "full" ]; then
-  [ -n "$weekly_seg" ] && line2="${line2}  ${weekly_seg}"
-else
-  line3="$weekly_seg"
-fi
-
-# Print
-printf '\n%s' "$line2"
-[ -n "$line3" ] && printf '\n%s' "$line3"
-printf '\n'
+render_group 1
+render_group 2

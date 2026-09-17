@@ -41,43 +41,112 @@ cs clean                            # remove labels for dead sessions
 A custom Claude Code statusline showing everything at a glance:
 
 ```
-🏷️ fix auth module  📁 workspace/my-project  🌿 feat/auth  🤖 Opus 4.6  📟 v2.1.70  🎨 concise
-🧠 Ctx: 56% [=====-----]  ⚡ Session: 40% used, resets in 2h 31m [====------]  📊 Weekly: 6% used, resets in 6d 15h [----------]
+🏷️ fix auth module  📁 workspace/my-project  🌿 feat/auth  🤖 Opus 5  📟 v2.1.274  🎨 concise
+🧠 Ctx: 56% [=====-----]  ⚡ Session: 40% used, resets in 2h 31m [====------]  📊 Weekly(all): 57% used, resets in 1d 13h [=====-----]  🎭 Fable: 5% used [----------]
 ```
 
-**Line 1** — Session label, working directory, git branch, model, Claude Code version, output style
+**Identity group** — Session label, working directory, git branch, model, Claude Code version, output style
 
-**Line 2** — Context window remaining, session (5h) usage limit, weekly (7d) usage limit
+**Usage group** — Context window remaining, session (5h) usage limit, weekly (7d) usage limit for **all models**, and the weekly limit for the **model-scoped bucket** (e.g. Fable) when your plan has one
 
-The statusline auto-adapts to terminal width so Claude Code doesn't clip it. Two modes:
+Each group is one row when it fits, and wraps onto more when it doesn't.
 
-| Width  | Layout                                                                                     |
-|--------|--------------------------------------------------------------------------------------------|
-| ≥ 140  | **full** — everything inline with progress bars (`Session: 24% used, resets in 1h 12m [==--------]`) |
-| < 140  | **compact** — short labels (`S:` / `W:`), no bars, Weekly on its own row; line 1 drops `📟 version`, `🎨 style`, and the ` (1M context)` suffix |
+**Width never costs you a segment.** Every segment is built at three verbosity tiers, and
+the statusline picks the richest tier that fits, then *wraps* instead of dropping anything.
+Split your terminal in half and both panes still show the complete status line:
 
-Terminal width is detected in this order: `CS_STATUSLINE_WIDTH` override → `$COLUMNS` → reading the controlling pts device of an ancestor process → `100` fallback.
+| Tier | Looks like | Used when |
+|------|------------|-----------|
+| 1 | `⚡ Session: 24% used, resets in 1h 12m [==--------]` | it fits the row budget |
+| 2 | `⚡ Session: 24% used, 1h12m` | tier 1 would need extra rows |
+| 3 | `⚡ S: 24% 1h12m` | tier 2 would too |
+
+`CS_STATUSLINE_MAX_ROWS` (default `1`) is the row budget **per group** — identity segments
+are one group, usage segments the other. Raise it to `2` to prefer progress bars over
+compactness on a narrow pane. If even tier 3 overflows the budget, segments wrap onto
+extra rows; nothing is ever dropped or clipped.
+
+```
+# 70 columns — same segments, terser, wrapped
+🏷️ fix auth module  📁 workspace/my-project  🌿 feat/auth
+🤖 Opus 5 (1M)  📟 v2.1.274  🎨 concise
+🧠 Ctx: 56%  ⚡ S: 40% 2h31m  📊 W(all): 57% 1d13h  🎭 Fable: 5%
+```
+
+Widths are measured with `python3` when available, so CJK session labels and emoji are
+counted as double-width; without it byte counts are used, which over-estimates and so
+wraps early rather than clipping.
+
+Terminal width is detected in this order: `CS_STATUSLINE_WIDTH` override → `$COLUMNS` →
+reading the controlling pts device of an ancestor process → `100` fallback.
+
+The weekly segment is labelled `Weekly` when it is the only weekly number, and `Weekly(all)` once a per-model bucket sits next to it.
 
 ### 3. Usage Limit Monitoring
 
-Usage limits displayed in the statusline, read straight from the data Claude Code
-already pipes to the statusline on stdin (`rate_limits`) — no API call, no OAuth
-token, no background hook:
+Two sources, by necessity:
+
+**Session (5h) and Weekly (7d), all models** — read straight from the data Claude Code
+already pipes to the statusline on stdin (`rate_limits`). No API call, no OAuth token.
 
 - **Session (5h)** — current 5-hour window utilization
-- **Weekly (7d)** — 7-day rolling utilization
+- **Weekly (7d), all models** — 7-day rolling utilization across every model
 - Color-coded: mint (normal) → peach (>=70%) → red (>=90%) → bold red (limit hit)
 
 `rate_limits` is provided by Claude Code **only for Claude.ai subscribers (Pro/Max)**,
 and only after the first API response in a session; each window can be independently
-absent. When it isn't present (e.g. API-key auth, or very early in a session), the
-Session/Weekly segments are simply hidden — nothing to configure, nothing to fail.
+absent. A window you just opened therefore reports nothing at all until you send your
+first prompt.
+
+The probe cache below carries copies of both numbers, so a freshly opened window shows
+them straight away, **marked with `~`** (`⚡ Session: ~11% used, 4h48m`) to say they came
+from cache rather than from this session. They switch to the native values — and the `~`
+disappears — on the first API response. With no usable cache (API-key auth, probe off,
+cache older than `CS_USAGE_MAX_AGE`), the segments are simply hidden, as before.
+
+**Weekly (7d), per model** — e.g. the separate Fable weekly bucket that `/usage` shows
+as "Current week (Fable)". This one is *not* on the statusline stdin at all: Claude Code
+only passes the aggregate `seven_day`. So `usage-probe.sh` reads it from the same place
+`/usage` does — a plain `GET /api/oauth/usage` with the OAuth token Claude Code already
+stores — and caches it in `$CLAUDE_CONFIG_DIR/model-usage-cache.json`. The same response
+carries the session and all-model weekly windows, which are cached too and used to fill
+the gap before Claude Code reports them.
+
+- **Event-driven, not polled.** The native `five_hour` / `seven_day` windows above arrive
+  free on every statusline render and are always current — and nothing can consume the
+  per-model bucket without also moving them. So the statusline fingerprints those windows,
+  records the fingerprint in the cache, and asks for a refresh only when it changes.
+  **An idle session makes zero requests.** An active one makes at most one per
+  `CS_USAGE_MIN_INTERVAL` (180s), and a lock keeps concurrent sessions from stacking up.
+- Fired **in the background by the statusline** with every fd detached, so rendering never
+  waits on the network (measured: ~0.19s per statusline run).
+- It is a **usage read, not a model call** — it costs no tokens.
+- Whatever the cache holds is what gets drawn. If the probe fails (API-key auth, expired
+  token, no network) or the cache goes stale (>30 min), the segment disappears and the
+  weekly label falls back to plain `Weekly`. The reason is written to `statusline.log`.
+- The per-model reset time is only printed when it differs from the all-models reset —
+  normally both buckets roll over together.
+- Whatever buckets the endpoint returns are shown by name, so this works unchanged for
+  an `Opus` bucket or any future model-scoped window.
+
+Tunables (env vars):
+
+| Var | Default | Effect |
+|-----|---------|--------|
+| `CS_MODEL_USAGE=0` | on | Turn the per-model segment and its probe off entirely |
+| `CS_USAGE_MIN_INTERVAL` | `180` | Floor between refreshes, even when usage keeps moving |
+| `CS_USAGE_ERROR_BACKOFF` | `900` | Slower retry after a failed probe |
+| `CS_USAGE_MAX_AGE` | `1800` | Hide the segment once the cache is older than this |
+| `CS_USAGE_FORCE=1` | off | Bypass the floor (for a manual probe run) |
+| `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | API host for the usage read |
+| `CS_STATUSLINE_MAX_ROWS` | `1` | Row budget per segment group (see above) |
 
 > **Earlier versions** ran a `ratelimit-probe.sh` PostToolUse hook that made a
-> background Haiku API call to fetch rate-limit headers. That's gone — Claude Code
-> now surfaces the same numbers natively, so the probe, its OAuth token handling,
-> and the `ratelimit-cache.json` file were all removed. Re-running the installer
-> (or updating the plugin) cleans up the old hook and files automatically.
+> background **Haiku API call** to fetch rate-limit headers. That's gone — Claude Code
+> surfaces the session/weekly numbers natively now, so the probe, its hook, and
+> `ratelimit-cache.json` were removed. Re-running the installer cleans them up.
+> `usage-probe.sh` is not a revival of it: it makes no model call, it only reads the
+> usage endpoint, and only for the one number Claude Code doesn't hand us.
 
 ### 4. Smart Auto-labeling
 
@@ -125,7 +194,9 @@ Then exit Claude Code (`exit` / Ctrl+D) and re-run `claude`. Verify in `/plugin`
 **Statusline shows `Ctx` but not `Session` / `Weekly` usage.** `rate_limits` is only in the statusline input for **Claude.ai subscribers (Pro/Max)**, and only **after the first API response** in a session. Common cases:
 
 - You authenticate with an **API key** (console billing) rather than a Pro/Max subscription — API-key usage has no 5h/7d windows, so these segments never appear. This is expected.
-- You just started the session and Claude hasn't made an API call yet — the segments appear once it does.
+- You just started the session and Claude hasn't made an API call yet. With a usable probe cache the numbers appear immediately with a `~` prefix; without one they appear on the first API call.
+
+**Session / Weekly show a `~` prefix.** Those numbers came from the probe cache because this session has no `rate_limits` of its own yet. They are replaced by live values as soon as Claude makes an API call.
 
 Quick check — see what Claude Code is actually handing the statusline:
 
@@ -134,6 +205,17 @@ echo '' | your-statusline-cmd    # or inspect: the input JSON has a top-level "r
 ```
 
 **`Ctx` shows `…`.** `context_window` is `null` before the first API response of a session; it fills in as soon as Claude makes a call.
+
+**Weekly shows only one number (no `🎭 Fable` segment).** The per-model bucket comes from `usage-probe.sh`, not from Claude Code. Check, in order:
+
+```bash
+CS_USAGE_FORCE=1 ~/.claude/usage-probe.sh   # force a probe, ignoring the interval floor
+cat "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/model-usage-cache.json"
+```
+
+- `"status": "error"` — `errorMsg` says why (no credentials file → API-key auth, which has no per-model window; HTTP 401 → re-login with `claude auth logout && claude auth login`).
+- `"models": []` — your plan has no model-scoped weekly window. Nothing to show.
+- Cache fine but nothing renders — it may be older than `CS_USAGE_MAX_AGE`. `grep "Per-model weekly" statusline.log` prints what the statusline saw, including whether it asked for a refresh (`refresh=1`) and why.
 
 ---
 
@@ -151,11 +233,11 @@ Custom bin directory: `./cs install /usr/local/bin`
 
 ## Requirements
 
-- Python 3.6+ — for the `cs` dashboard and auto-labeling
+- Python 3.6+ — for the `cs` dashboard, auto-labeling, and the per-model usage probe
 - Linux (the `cs` dashboard uses the `/proc` filesystem)
 - `jq` — **optional**; the statusline parses its JSON with a pure-bash fallback when `jq` isn't on `PATH`
 
-The statusline itself has no other dependencies — usage limits come straight from Claude Code's statusline input, so there's no API call, OAuth token, or `curl` involved.
+Session and weekly (all models) limits come straight from Claude Code's statusline input — no API call, no OAuth token. Only the per-model weekly bucket needs the `usage-probe.sh` read, which uses Python's `urllib` (no `curl` dependency) and can be switched off with `CS_MODEL_USAGE=0`.
 
 ## Custom Claude config dir
 

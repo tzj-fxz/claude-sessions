@@ -7,7 +7,7 @@
     {
       "name": "claude-sessions",
       "source": "./",
-      "description": "Auto-label Claude Code sessions and surface usage limits in the statusline."
+      "description": "Auto-label Claude Code sessions and surface usage limits — session, weekly, and per-model — in the statusline."
     }
   ]
 }

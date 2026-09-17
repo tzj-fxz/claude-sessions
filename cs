@@ -541,6 +541,14 @@ def cmd_install(target_dir=None):
     _symlink_or_copy(statusline_src, sl_dst)
     installed_files["statusline.sh"] = str(sl_dst)
 
+    # The statusline fires usage-probe.sh from its own directory, so the probe has to
+    # land next to it — including when the statusline gets copied instead of linked.
+    probe_src = script_dir / "usage-probe.sh"
+    if probe_src.exists():
+        probe_dst = claude_dir / "usage-probe.sh"
+        _symlink_or_copy(probe_src, probe_dst)
+        installed_files["usage-probe.sh"] = str(probe_dst)
+
     # Clean up the retired ratelimit-probe.sh (superseded by native rate_limits in
     # the statusline stdin). Remove any stale symlink/copy and its cache from prior installs.
     for stale in (claude_dir / "ratelimit-probe.sh", claude_dir / "ratelimit-cache.json"):

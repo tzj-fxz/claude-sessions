@@ -15,13 +15,9 @@
 # of open sessions can hammer the endpoint. It is a usage read, not a model call —
 # it costs no tokens.
 #
-# The fingerprint of the native windows that prompted the refresh is recorded in the
-# cache as "seen", which is how the statusline knows the cache is still current.
-#
 # Env:
 #   CS_MODEL_USAGE=0          disable entirely (statusline then shows one Weekly segment)
 #   CS_USAGE_MIN_INTERVAL=180 floor between probes; CS_USAGE_FORCE=1 bypasses it
-#   CS_USAGE_FINGERPRINT      native-window fingerprint to record alongside the result
 #   ANTHROPIC_BASE_URL        override the API host
 
 CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
@@ -45,11 +41,10 @@ command -v python3 >/dev/null 2>&1 || exit 0
 
 write_error() {
   python3 - "$CACHE" "$1" "$2" <<'PY' 2>/dev/null
-import json, os, sys, time
+import json, sys, time
 path, code, msg = sys.argv[1], sys.argv[2], sys.argv[3]
 json.dump({"probeTime": int(time.time()), "status": "error", "error": code,
-           "errorMsg": msg, "seen": os.environ.get("CS_USAGE_FINGERPRINT", "")},
-          open(path, "w"), indent=2)
+           "errorMsg": msg}, open(path, "w"), indent=2)
 PY
 }
 
@@ -99,9 +94,6 @@ url = os.environ["CS_USAGE_BASE"].rstrip("/") + "/api/oauth/usage"
 
 def write(obj):
     obj["probeTime"] = int(time.time())
-    # What the statusline saw on stdin when it asked for this refresh: it compares
-    # this against the live windows to decide whether the cache is still current.
-    obj["seen"] = os.environ.get("CS_USAGE_FINGERPRINT", "")
     tmp = cache + ".tmp"
     with open(tmp, "w") as f:
         json.dump(obj, f, indent=2)

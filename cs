@@ -574,11 +574,15 @@ def cmd_install(target_dir=None):
         except Exception:
             pass
 
-    # StatusLine config
+    # StatusLine config. refreshInterval re-runs the status line on a timer as well as on
+    # events; without it a window Claude Code sees no activity in never re-runs the script,
+    # so its usage numbers freeze while you work in another one. Keep an existing choice.
+    prev_sl = settings.get("statusLine") or {}
     settings["statusLine"] = {
         "type": "command",
         "command": str(sl_dst),
         "padding": 0,
+        "refreshInterval": prev_sl.get("refreshInterval", 30),
     }
 
     # Add cs-hook to PreToolUse hooks (if not already present)

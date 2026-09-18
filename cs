@@ -582,7 +582,7 @@ def cmd_install(target_dir=None):
         "type": "command",
         "command": str(sl_dst),
         "padding": 0,
-        "refreshInterval": prev_sl.get("refreshInterval", 30),
+        "refreshInterval": prev_sl.get("refreshInterval", 60),
     }
 
     # Add cs-hook to PreToolUse hooks (if not already present)

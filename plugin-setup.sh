@@ -44,7 +44,7 @@ data["statusLine"] = {
     "type": "command",
     "command": sl,
     "padding": 0,
-    "refreshInterval": existing.get("refreshInterval", 30),
+    "refreshInterval": existing.get("refreshInterval", 60),
 }
 os.makedirs(os.path.dirname(path), exist_ok=True)
 with open(path, "w") as f:

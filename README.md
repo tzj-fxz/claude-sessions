@@ -124,7 +124,7 @@ the gap before Claude Code reports them.
 - It is a **usage read, not a model call** — it costs no tokens.
 - Whatever the cache holds is what gets drawn. If the probe fails (API-key auth, expired
   token, no network) or the cache goes stale (>30 min), the segment disappears and the
-  weekly label falls back to plain `Weekly`. The reason is written to `statusline.log`.
+  weekly label falls back to plain `Weekly`. The reason is logged when `CS_STATUSLINE_LOG=1`.
 - The per-model reset time is only printed when it differs from the all-models reset —
   normally both buckets roll over together.
 - Whatever buckets the endpoint returns are shown by name, so this works unchanged for
@@ -141,6 +141,8 @@ Tunables (env vars):
 | `CS_USAGE_FORCE=1` | off | Bypass the floor (for a manual probe run) |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | API host for the usage read |
 | `CS_STATUSLINE_MAX_ROWS` | `1` | Row budget per segment group (see above) |
+| `CS_STATUSLINE_LOG=1` | off | Write `statusline.log` (the whole stdin payload per render) |
+| `CS_STATUSLINE_LOG_MAX` | `1048576` | Rotate that log to `.log.1` past this size |
 
 > **Earlier versions** ran a `ratelimit-probe.sh` PostToolUse hook that made a
 > background **Haiku API call** to fetch rate-limit headers. That's gone — Claude Code
@@ -160,14 +162,20 @@ an idle window does not even re-render.
 
 Both halves are handled:
 
-**Re-render on a timer.** The installer sets `statusLine.refreshInterval` to 30 seconds:
+**Re-render on a timer.** The installer sets `statusLine.refreshInterval` to 60 seconds:
 
 ```json
-"statusLine": { "type": "command", "command": "…/statusline.sh", "padding": 0, "refreshInterval": 30 }
+"statusLine": { "type": "command", "command": "…/statusline.sh", "padding": 0, "refreshInterval": 60 }
 ```
 
 Claude Code then re-runs the command every N seconds *in addition to* its event-driven
 updates. An existing value is kept; remove the key for event-driven only.
+
+This is not free: every open session re-runs the script on that timer whether or not you
+are looking at it. One render costs ~190ms and forks ~115 short-lived processes, so six
+sessions at 60s work out to ~360 renders an hour, roughly 2% of one core around the clock.
+Halving the interval doubles that. It is also why the debug log is off by default — see
+`CS_STATUSLINE_LOG` below.
 
 **Show whoever has the newer reading.** The probe cache is one file per Claude config dir,
 shared by every session on the machine. Usage only grows inside a window, so a higher
@@ -203,7 +211,21 @@ Examples:
 | why is usage limit not showing for other users on this machine | debug usage limit display |
 | fix bug in auth | fix bug in auth |
 
-### 6. Install & Upgrade
+### 6. Known Limitations
+
+- **Cached numbers can be up to `CS_USAGE_MAX_AGE` old.** A `~` value is normally seconds
+  to minutes behind; if every session is idle it can be up to 30 minutes behind before the
+  staleness rule refreshes it. Don't size a big job off a `~` number.
+- **"Higher percentage is newer" assumes usage only grows inside a window.** If the server
+  ever revises a percentage *down* within the same `resets_at` — a correction, a refund,
+  rolling-window semantics — the higher cached value keeps winning until that window
+  resets. Deliberate trade: it is what lets sessions order two readings with no clock.
+- **An API-key session borrows subscription numbers.** API-key auth gets no `rate_limits`
+  on stdin, so the `~` fill shows the cached *subscription* windows, which do not govern
+  that session at all. The statusline input carries no auth-type field to tell them apart.
+  Set `CS_MODEL_USAGE=0` in a config dir used that way.
+
+### 7. Install & Upgrade
 
 **Recommended — Claude Code plugin** (zero-config hooks):
 
@@ -253,7 +275,12 @@ cat "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/model-usage-cache.json"
 
 - `"status": "error"` — `errorMsg` says why (no credentials file → API-key auth, which has no per-model window; HTTP 401 → re-login with `claude auth logout && claude auth login`).
 - `"models": []` — your plan has no model-scoped weekly window. Nothing to show.
-- Cache fine but nothing renders — it may be older than `CS_USAGE_MAX_AGE`. `grep "Per-model weekly" statusline.log` prints what the statusline saw, including whether it asked for a refresh (`refresh=1`) and why.
+- Cache fine but nothing renders — it may be older than `CS_USAGE_MAX_AGE`. Turn the log on to see what the statusline actually saw, including whether it asked for a refresh:
+
+```bash
+CS_STATUSLINE_LOG=1 ~/.claude/plugins/.../statusline.sh < /dev/null   # or export it for a session
+grep "Usage cache" statusline.log | tail
+```
 
 ---
 

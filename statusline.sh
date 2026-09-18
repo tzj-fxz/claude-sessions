@@ -63,18 +63,35 @@ LOG_FILE="${SCRIPT_DIR}/statusline.log"
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 
 # ---- logging ----
-{
-  echo "[$TIMESTAMP] Status line triggered (cc-statusline v${STATUSLINE_VERSION})"
-  echo "[$TIMESTAMP] Input:"
-  if [ "$HAS_JQ" -eq 1 ]; then
-    echo "$input" | jq . 2>/dev/null || echo "$input"
-    echo "[$TIMESTAMP] Using jq for JSON parsing"
-  else
-    echo "$input"
-    echo "[$TIMESTAMP] WARNING: jq not found, using bash fallback for JSON parsing"
+# Off unless asked for. This dumps the whole stdin payload on every render, which was
+# survivable while renders were event-driven but is not now that statusLine.refreshInterval
+# keeps every session rendering on a timer: six idle sessions produce ~720 renders an hour,
+# about 20MB of log a day that nobody reads. Turn it on with CS_STATUSLINE_LOG=1 when
+# something needs diagnosing; it rotates at CS_STATUSLINE_LOG_MAX bytes (1MB) so even then
+# it cannot grow without bound.
+sl_log="${CS_STATUSLINE_LOG:-0}"
+[ "$sl_log" = "1" ] || LOG_FILE=""
+
+if [ -n "$LOG_FILE" ]; then
+  sl_log_max="${CS_STATUSLINE_LOG_MAX:-1048576}"
+  [[ "$sl_log_max" =~ ^[0-9]+$ ]] || sl_log_max=1048576
+  sl_log_size=$(stat -c %s "$LOG_FILE" 2>/dev/null || stat -f %z "$LOG_FILE" 2>/dev/null || echo 0)
+  if [ "$sl_log_size" -gt "$sl_log_max" ] 2>/dev/null; then
+    mv -f "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null
   fi
-  echo "---"
-} >> "$LOG_FILE" 2>/dev/null
+  {
+    echo "[$TIMESTAMP] Status line triggered (cc-statusline v${STATUSLINE_VERSION})"
+    echo "[$TIMESTAMP] Input:"
+    if [ "$HAS_JQ" -eq 1 ]; then
+      echo "$input" | jq . 2>/dev/null || echo "$input"
+      echo "[$TIMESTAMP] Using jq for JSON parsing"
+    else
+      echo "$input"
+      echo "[$TIMESTAMP] WARNING: jq not found, using bash fallback for JSON parsing"
+    fi
+    echo "---"
+  } >> "$LOG_FILE" 2>/dev/null
+fi
 
 # ---- color helpers (force colors for Claude Code) ----
 use_color=1
@@ -478,11 +495,13 @@ if [ "${CS_MODEL_USAGE:-1}" != "0" ]; then
 fi
 
 # ---- log extracted data ----
+if [ -n "$LOG_FILE" ]; then
 {
   echo "[$TIMESTAMP] Extracted: dir=${current_dir:-}, model=${model_name:-}, git=${git_branch:-}, ctx=${context_pct:-}, session=${rl_session_pct:-}%, weekly=${rl_weekly_pct:-}%"
   echo "[$TIMESTAMP] Usage cache: ${#mu_names[@]} model bucket(s)${mu_names[0]:+ (${mu_names[0]} ${mu_pcts[0]}%)} status=${mu_status:-none} age=${mu_age}s vs-native=s:${mu_s_state}/w:${mu_w_state} filled=s${rl_s_cached}/w${rl_w_cached} refresh=${mu_need}${mu_note:+ note=${mu_note}}"
   echo "[$TIMESTAMP] Width: term_cols=${term_cols} (source=${term_cols_src}) max_rows=${sl_max_rows}"
 } >> "$LOG_FILE" 2>/dev/null
+fi
 
 # ---- session label from cs tool ----
 label_color() { if [ "$use_color" -eq 1 ]; then printf '\033[1;38;5;214m'; fi; }  # bold orange

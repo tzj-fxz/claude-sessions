@@ -63,18 +63,35 @@ LOG_FILE="${SCRIPT_DIR}/statusline.log"
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 
 # ---- logging ----
-{
-  echo "[$TIMESTAMP] Status line triggered (cc-statusline v${STATUSLINE_VERSION})"
-  echo "[$TIMESTAMP] Input:"
-  if [ "$HAS_JQ" -eq 1 ]; then
-    echo "$input" | jq . 2>/dev/null || echo "$input"
-    echo "[$TIMESTAMP] Using jq for JSON parsing"
-  else
-    echo "$input"
-    echo "[$TIMESTAMP] WARNING: jq not found, using bash fallback for JSON parsing"
+# Off unless asked for. This dumps the whole stdin payload on every render, which was
+# survivable while renders were event-driven but is not now that statusLine.refreshInterval
+# keeps every session rendering on a timer: six idle sessions produce ~720 renders an hour,
+# about 20MB of log a day that nobody reads. Turn it on with CS_STATUSLINE_LOG=1 when
+# something needs diagnosing; it rotates at CS_STATUSLINE_LOG_MAX bytes (1MB) so even then
+# it cannot grow without bound.
+sl_log="${CS_STATUSLINE_LOG:-0}"
+[ "$sl_log" = "1" ] || LOG_FILE=""
+
+if [ -n "$LOG_FILE" ]; then
+  sl_log_max="${CS_STATUSLINE_LOG_MAX:-1048576}"
+  [[ "$sl_log_max" =~ ^[0-9]+$ ]] || sl_log_max=1048576
+  sl_log_size=$(stat -c %s "$LOG_FILE" 2>/dev/null || stat -f %z "$LOG_FILE" 2>/dev/null || echo 0)
+  if [ "$sl_log_size" -gt "$sl_log_max" ] 2>/dev/null; then
+    mv -f "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null
   fi
-  echo "---"
-} >> "$LOG_FILE" 2>/dev/null
+  {
+    echo "[$TIMESTAMP] Status line triggered (cc-statusline v${STATUSLINE_VERSION})"
+    echo "[$TIMESTAMP] Input:"
+    if [ "$HAS_JQ" -eq 1 ]; then
+      echo "$input" | jq . 2>/dev/null || echo "$input"
+      echo "[$TIMESTAMP] Using jq for JSON parsing"
+    else
+      echo "$input"
+      echo "[$TIMESTAMP] WARNING: jq not found, using bash fallback for JSON parsing"
+    fi
+    echo "---"
+  } >> "$LOG_FILE" 2>/dev/null
+fi
 
 # ---- color helpers (force colors for Claude Code) ----
 use_color=1
@@ -259,13 +276,30 @@ else
   r7d=$(echo "$sd" | grep -o '"resets_at"[[:space:]]*:[[:space:]]*[0-9]\+' | grep -o '[0-9]\+$')
 fi
 
-# Fingerprint of the *native* windows, taken before any cache fill below: this is what
-# tells us whether the cached per-model number can still be current.
-mu_fp="${u5h}|${r5h}|${u7d}|${r7d}"
-mu_fp_known=0
-if { [ -n "$u5h" ] && [ "$u5h" != "null" ]; } || { [ -n "$u7d" ] && [ "$u7d" != "null" ]; }; then
-  mu_fp_known=1
-fi
+# Keep the native windows as this session last heard them, before the cache fill below.
+# They are a per-session snapshot: Claude Code only updates them after *this* session's
+# API responses, so a window you left idle keeps reporting whatever it was told last.
+nat_u5h="$u5h"; nat_r5h="$r5h"; nat_u7d="$u7d"; nat_r7d="$r7d"
+
+# Compare a native window against the cached one. Usage only grows inside a window, so a
+# higher percentage for the same resets_at is simply the newer reading — which is how one
+# session tells whether the shared cache has moved ahead of it (another session has been
+# working) or fallen behind it (this session has usage the cache has not seen yet).
+# The two sources round differently (headers keep full precision, the usage endpoint
+# rounds to whole percent), so a point of difference does not count as movement.
+win_state() { # native_pct native_reset cached_pct cached_reset -> ahead|behind|same|unknown
+  awk -v np="$1" -v nr="$2" -v cp="$3" -v cr="$4" 'BEGIN{
+    if (np == "" || np == "null" || cp == "") { print "unknown"; exit }
+    if (nr != "" && nr != "null" && cr != "" && cr+0 != 0) {
+      d = nr - cr; if (d < 0) d = -d
+      if (d > 60) { print "behind"; exit }   # window rolled over; cache is a window behind
+    }
+    d = np - cp
+    if (d > 1)  { print "behind"; exit }
+    if (d < -1) { print "ahead"; exit }
+    print "same"
+  }'
+}
 
 # ---- usage-probe cache ----
 # Holds the per-model weekly bucket (Fable, Opus, ...), which is not on the statusline
@@ -276,7 +310,7 @@ MODEL_USAGE_MAX_AGE="${CS_USAGE_MAX_AGE:-1800}"             # ignore the cache p
 MODEL_USAGE_MIN_INTERVAL="${CS_USAGE_MIN_INTERVAL:-180}"    # floor between refreshes
 MODEL_USAGE_ERROR_BACKOFF="${CS_USAGE_ERROR_BACKOFF:-900}"  # slower retry after a failure
 mu_names=(); mu_pcts=(); mu_resets=()
-mu_note=""; mu_status=""; mu_seen=""; mu_age=-1; mu_need=0; mu_fresh=0
+mu_note=""; mu_status=""; mu_age=-1; mu_need=0; mu_fresh=0
 mu_s_pct=""; mu_s_reset=""; mu_w_pct=""; mu_w_reset=""
 
 if [ "${CS_MODEL_USAGE:-1}" != "0" ] && [ -f "$MODEL_USAGE_CACHE" ]; then
@@ -286,7 +320,7 @@ if [ "${CS_MODEL_USAGE:-1}" != "0" ] && [ -f "$MODEL_USAGE_CACHE" ]; then
   # One TSV record per line: "#" the cache's own state, "s"/"w" the session and
   # all-model weekly windows, "m" a per-model bucket.
   if [ "$HAS_JQ" -eq 1 ]; then
-    mu_rows=$(jq -r '["#", (.status // ""), (.seen // ""), (.errorMsg // "")],
+    mu_rows=$(jq -r '["#", (.status // ""), (.errorMsg // "")],
                      ["s", (.session.percent // ""), (.session.resetsAt // "")],
                      ["w", (.weeklyAll.percent // ""), (.weeklyAll.resetsAt // "")],
                      ((.models // [])[] | ["m", .name, (.percent // 0), (.resetsAt // 0)])
@@ -298,7 +332,7 @@ try:
     d = json.load(open(sys.argv[1]))
 except Exception:
     sys.exit(0)
-print("#\t%s\t%s\t%s" % (d.get("status") or "", d.get("seen") or "", d.get("errorMsg") or ""))
+print("#\t%s\t%s" % (d.get("status") or "", d.get("errorMsg") or ""))
 for key, tag in (("session", "s"), ("weeklyAll", "w")):
     win = d.get(key) or {}
     print("%s\t%s\t%s" % (tag, win.get("percent", ""), win.get("resetsAt", "")))
@@ -309,11 +343,11 @@ for m in d.get("models") or []:
   while IFS=$'\t' read -r mu_k mu_a mu_b mu_c; do
     case "$mu_k" in
       '#')
-        mu_status="$mu_a"; mu_seen="$mu_b"
-        [ "$mu_status" = "ok" ] || mu_note="${mu_c:-$mu_status}"
+        mu_status="$mu_a"
+        [ "$mu_status" = "ok" ] || mu_note="${mu_b:-$mu_status}"
         ;;
-      s) [ "$mu_status" = "ok" ] && { mu_s_pct="$mu_a"; mu_s_reset="$mu_b"; } ;;
-      w) [ "$mu_status" = "ok" ] && { mu_w_pct="$mu_a"; mu_w_reset="$mu_b"; } ;;
+      s) [ "$mu_status" = "ok" ] && [ "$mu_fresh" -eq 1 ] && { mu_s_pct="$mu_a"; mu_s_reset="$mu_b"; } ;;
+      w) [ "$mu_status" = "ok" ] && [ "$mu_fresh" -eq 1 ] && { mu_w_pct="$mu_a"; mu_w_reset="$mu_b"; } ;;
       m)
         [ -n "$mu_a" ] || continue
         [ "$mu_fresh" -eq 1 ] || continue
@@ -326,18 +360,22 @@ for m in d.get("models") or []:
   [ "$mu_fresh" -eq 1 ] || mu_note="cache stale (${mu_age}s old)"
 fi
 
-# Claude Code omits rate_limits entirely until a window's first API response, so a
-# freshly opened terminal would show no Session/Weekly at all. The cache has both
-# numbers, so use them meanwhile — marked with ~ — and hand back to the native values
-# the moment they arrive.
-rl_s_cached=0; rl_w_cached=0
+# Two cases where the shared cache beats what this session was told:
+#   unknown — Claude Code omits rate_limits entirely until a window's first API response,
+#             so a freshly opened terminal would otherwise show no Session/Weekly at all;
+#   ahead   — you have been working in another window, and this one's snapshot is stale.
+# Both are marked with ~ and give way to the native values as soon as they catch up.
+mu_s_state="unknown"; mu_w_state="unknown"
 if [ "$mu_fresh" -eq 1 ]; then
-  if { [ -z "$u5h" ] || [ "$u5h" = "null" ]; } && [ -n "$mu_s_pct" ]; then
-    u5h="$mu_s_pct"; r5h="$mu_s_reset"; rl_s_cached=1
-  fi
-  if { [ -z "$u7d" ] || [ "$u7d" = "null" ]; } && [ -n "$mu_w_pct" ]; then
-    u7d="$mu_w_pct"; r7d="$mu_w_reset"; rl_w_cached=1
-  fi
+  mu_s_state=$(win_state "$nat_u5h" "$nat_r5h" "$mu_s_pct" "$mu_s_reset")
+  mu_w_state=$(win_state "$nat_u7d" "$nat_r7d" "$mu_w_pct" "$mu_w_reset")
+fi
+rl_s_cached=0; rl_w_cached=0
+if [ -n "$mu_s_pct" ] && { [ "$mu_s_state" = "ahead" ] || [ "$mu_s_state" = "unknown" ]; }; then
+  u5h="$mu_s_pct"; r5h="$mu_s_reset"; rl_s_cached=1
+fi
+if [ -n "$mu_w_pct" ] && { [ "$mu_w_state" = "ahead" ] || [ "$mu_w_state" = "unknown" ]; }; then
+  u7d="$mu_w_pct"; r7d="$mu_w_reset"; rl_w_cached=1
 fi
 rl_s_mark=""; [ "$rl_s_cached" -eq 1 ] && rl_s_mark="~"
 rl_w_mark=""; [ "$rl_w_cached" -eq 1 ] && rl_w_mark="~"
@@ -413,19 +451,26 @@ if [ -n "$u7d" ] && [ "$u7d" != "null" ]; then
 fi
 
 # ---- refresh the usage cache, event-driven ----
-# The native windows arrive free on every render and are always current, and nothing can
-# consume the per-model bucket without also moving them — so a request is only worth
-# making when their fingerprint changes. An idle session makes none at all; an active one
-# at most one per CS_USAGE_MIN_INTERVAL. When Claude Code has not reported any windows
-# yet we have no fingerprint to compare, so we fall back to plain staleness.
+# A request is only worth making when this session knows something the cache does not:
+# its native windows have moved past the cached ones, so the per-model bucket has moved
+# too. A session left idle compares equal and asks for nothing, however often it renders
+# — the work of refreshing falls on whichever session is actually consuming usage. The
+# staleness rule is the backstop for when every session is idle.
 if [ "${CS_MODEL_USAGE:-1}" != "0" ]; then
+  mu_behind=0
+  { [ "$mu_s_state" = "behind" ] || [ "$mu_w_state" = "behind" ]; } && mu_behind=1
+  # Native windows with nothing cached to compare them to: the cache needs those numbers.
+  if [ "$mu_fresh" -eq 1 ] && [ -z "$mu_s_pct" ] && [ -n "$nat_u5h" ] && [ "$nat_u5h" != "null" ]; then
+    mu_behind=1
+  fi
+
   if [ ! -f "$MODEL_USAGE_CACHE" ]; then
     mu_need=1
   elif [ "$mu_status" != "ok" ]; then
     [ "$mu_age" -ge "$MODEL_USAGE_ERROR_BACKOFF" ] && mu_need=1
-  elif [ "$mu_fp_known" -eq 0 ]; then
-    [ "$mu_age" -ge "$MODEL_USAGE_MAX_AGE" ] && mu_need=1
-  elif [ "$mu_seen" != "$mu_fp" ]; then
+  elif [ "$mu_age" -ge "$MODEL_USAGE_MAX_AGE" ]; then
+    mu_need=1
+  elif [ "$mu_behind" -eq 1 ]; then
     [ "$mu_age" -ge "$MODEL_USAGE_MIN_INTERVAL" ] && mu_need=1
   fi
 
@@ -445,16 +490,18 @@ if [ "${CS_MODEL_USAGE:-1}" != "0" ]; then
     [ -x "$probe" ] || probe="$SCRIPT_DIR/usage-probe.sh"
     # Detach every fd: a background child still holding our stdout would keep Claude
     # Code waiting on the pipe before it can draw the statusline.
-    [ -x "$probe" ] && ( CS_USAGE_FINGERPRINT="$mu_fp" "$probe" </dev/null >/dev/null 2>&1 & )
+    [ -x "$probe" ] && ( "$probe" </dev/null >/dev/null 2>&1 & )
   fi
 fi
 
 # ---- log extracted data ----
+if [ -n "$LOG_FILE" ]; then
 {
   echo "[$TIMESTAMP] Extracted: dir=${current_dir:-}, model=${model_name:-}, git=${git_branch:-}, ctx=${context_pct:-}, session=${rl_session_pct:-}%, weekly=${rl_weekly_pct:-}%"
-  echo "[$TIMESTAMP] Usage cache: ${#mu_names[@]} model bucket(s)${mu_names[0]:+ (${mu_names[0]} ${mu_pcts[0]}%)} status=${mu_status:-none} age=${mu_age}s refresh=${mu_need} fp_known=${mu_fp_known} filled=s${rl_s_cached}/w${rl_w_cached}${mu_note:+ note=${mu_note}}"
+  echo "[$TIMESTAMP] Usage cache: ${#mu_names[@]} model bucket(s)${mu_names[0]:+ (${mu_names[0]} ${mu_pcts[0]}%)} status=${mu_status:-none} age=${mu_age}s vs-native=s:${mu_s_state}/w:${mu_w_state} filled=s${rl_s_cached}/w${rl_w_cached} refresh=${mu_need}${mu_note:+ note=${mu_note}}"
   echo "[$TIMESTAMP] Width: term_cols=${term_cols} (source=${term_cols_src}) max_rows=${sl_max_rows}"
 } >> "$LOG_FILE" 2>/dev/null
+fi
 
 # ---- session label from cs tool ----
 label_color() { if [ "$use_color" -eq 1 ]; then printf '\033[1;38;5;214m'; fi; }  # bold orange

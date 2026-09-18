@@ -36,7 +36,16 @@ if os.path.exists(path):
         data = json.loads(open(path).read())
     except Exception:
         data = {}
-data["statusLine"] = {"type": "command", "command": sl, "padding": 0}
+# refreshInterval re-runs the status line on a timer as well as on events. Without it a
+# window Claude Code sees no activity in never re-runs the script at all, so its usage
+# numbers freeze while you work in another one. Keep whatever the user chose.
+existing = data.get("statusLine") or {}
+data["statusLine"] = {
+    "type": "command",
+    "command": sl,
+    "padding": 0,
+    "refreshInterval": existing.get("refreshInterval", 60),
+}
 os.makedirs(os.path.dirname(path), exist_ok=True)
 with open(path, "w") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)

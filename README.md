@@ -112,18 +112,19 @@ stores — and caches it in `$CLAUDE_CONFIG_DIR/model-usage-cache.json`. The sam
 carries the session and all-model weekly windows, which are cached too and used to fill
 the gap before Claude Code reports them.
 
-- **Event-driven, not polled.** The native `five_hour` / `seven_day` windows above arrive
-  free on every statusline render and are always current — and nothing can consume the
-  per-model bucket without also moving them. So the statusline fingerprints those windows,
-  records the fingerprint in the cache, and asks for a refresh only when it changes.
-  **An idle session makes zero requests.** An active one makes at most one per
-  `CS_USAGE_MIN_INTERVAL` (180s), and a lock keeps concurrent sessions from stacking up.
+- **Event-driven, not polled.** A request is only worth making when a session knows
+  something the cache does not — its native windows have moved past the cached ones, so
+  the per-model bucket has moved too. **A session that is only reading the cache makes
+  zero requests**, however often it renders; refreshing falls on whichever session is
+  actually consuming usage, at most once per `CS_USAGE_MIN_INTERVAL` (180s), with a lock
+  so concurrent sessions never stack up. When every session is idle, staleness
+  (`CS_USAGE_MAX_AGE`) is the only thing that triggers a refresh.
 - Fired **in the background by the statusline** with every fd detached, so rendering never
   waits on the network (measured: ~0.19s per statusline run).
 - It is a **usage read, not a model call** — it costs no tokens.
 - Whatever the cache holds is what gets drawn. If the probe fails (API-key auth, expired
   token, no network) or the cache goes stale (>30 min), the segment disappears and the
-  weekly label falls back to plain `Weekly`. The reason is written to `statusline.log`.
+  weekly label falls back to plain `Weekly`. The reason is logged when `CS_STATUSLINE_LOG=1`.
 - The per-model reset time is only printed when it differs from the all-models reset —
   normally both buckets roll over together.
 - Whatever buckets the endpoint returns are shown by name, so this works unchanged for
@@ -136,10 +137,12 @@ Tunables (env vars):
 | `CS_MODEL_USAGE=0` | on | Turn the per-model segment and its probe off entirely |
 | `CS_USAGE_MIN_INTERVAL` | `180` | Floor between refreshes, even when usage keeps moving |
 | `CS_USAGE_ERROR_BACKOFF` | `900` | Slower retry after a failed probe |
-| `CS_USAGE_MAX_AGE` | `1800` | Hide the segment once the cache is older than this |
+| `CS_USAGE_MAX_AGE` | `1800` | Ignore (and refresh) the cache once it is older than this |
 | `CS_USAGE_FORCE=1` | off | Bypass the floor (for a manual probe run) |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | API host for the usage read |
 | `CS_STATUSLINE_MAX_ROWS` | `1` | Row budget per segment group (see above) |
+| `CS_STATUSLINE_LOG=1` | off | Write `statusline.log` (the whole stdin payload per render) |
+| `CS_STATUSLINE_LOG_MAX` | `1048576` | Rotate that log to `.log.1` past this size |
 
 > **Earlier versions** ran a `ratelimit-probe.sh` PostToolUse hook that made a
 > background **Haiku API call** to fetch rate-limit headers. That's gone — Claude Code
@@ -148,7 +151,50 @@ Tunables (env vars):
 > `usage-probe.sh` is not a revival of it: it makes no model call, it only reads the
 > usage endpoint, and only for the one number Claude Code doesn't hand us.
 
-### 4. Smart Auto-labeling
+### 4. Multiple Sessions
+
+Usage limits are account-wide, but each Claude Code session only learns about them from
+**its own** API responses — `rate_limits` on the statusline stdin is a per-session
+snapshot. A window you left idle keeps reporting whatever it was last told, however much
+you consume in another one. Worse, Claude Code re-runs the status line command only on
+events (a new assistant message, a model/mode/permission change — **not** keystrokes), so
+an idle window does not even re-render.
+
+Both halves are handled:
+
+**Re-render on a timer.** The installer sets `statusLine.refreshInterval` to 60 seconds:
+
+```json
+"statusLine": { "type": "command", "command": "…/statusline.sh", "padding": 0, "refreshInterval": 60 }
+```
+
+Claude Code then re-runs the command every N seconds *in addition to* its event-driven
+updates. An existing value is kept; remove the key for event-driven only.
+
+This is not free: every open session re-runs the script on that timer whether or not you
+are looking at it. One render costs ~190ms and forks ~115 short-lived processes, so six
+sessions at 60s work out to ~360 renders an hour, roughly 2% of one core around the clock.
+Halving the interval doubles that. It is also why the debug log is off by default — see
+`CS_STATUSLINE_LOG` below.
+
+**Show whoever has the newer reading.** The probe cache is one file per Claude config dir,
+shared by every session on the machine. Usage only grows inside a window, so a higher
+percentage for the same `resets_at` is simply the newer reading — each session compares
+its own snapshot against the cache and shows whichever is ahead, marking cached values
+with `~`:
+
+| This session vs. cache | Shows | Refreshes the cache |
+|---|---|---|
+| Ahead (you are working here) | its own native numbers | yes, so other windows catch up |
+| Behind (you are working elsewhere) | `~` cached numbers | no |
+| No `rate_limits` yet (just opened) | `~` cached numbers | no |
+| Equal | native numbers | no |
+
+So the session doing the work pays for the refresh, and every other window picks the
+result up on its next render — within `refreshInterval` seconds, without asking the API
+anything itself.
+
+### 5. Smart Auto-labeling
 
 A PreToolUse hook (`cs-hook`) automatically labels each session on first tool use:
 
@@ -165,7 +211,21 @@ Examples:
 | why is usage limit not showing for other users on this machine | debug usage limit display |
 | fix bug in auth | fix bug in auth |
 
-### 5. Install & Upgrade
+### 6. Known Limitations
+
+- **Cached numbers can be up to `CS_USAGE_MAX_AGE` old.** A `~` value is normally seconds
+  to minutes behind; if every session is idle it can be up to 30 minutes behind before the
+  staleness rule refreshes it. Don't size a big job off a `~` number.
+- **"Higher percentage is newer" assumes usage only grows inside a window.** If the server
+  ever revises a percentage *down* within the same `resets_at` — a correction, a refund,
+  rolling-window semantics — the higher cached value keeps winning until that window
+  resets. Deliberate trade: it is what lets sessions order two readings with no clock.
+- **An API-key session borrows subscription numbers.** API-key auth gets no `rate_limits`
+  on stdin, so the `~` fill shows the cached *subscription* windows, which do not govern
+  that session at all. The statusline input carries no auth-type field to tell them apart.
+  Set `CS_MODEL_USAGE=0` in a config dir used that way.
+
+### 7. Install & Upgrade
 
 **Recommended — Claude Code plugin** (zero-config hooks):
 
@@ -215,7 +275,12 @@ cat "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/model-usage-cache.json"
 
 - `"status": "error"` — `errorMsg` says why (no credentials file → API-key auth, which has no per-model window; HTTP 401 → re-login with `claude auth logout && claude auth login`).
 - `"models": []` — your plan has no model-scoped weekly window. Nothing to show.
-- Cache fine but nothing renders — it may be older than `CS_USAGE_MAX_AGE`. `grep "Per-model weekly" statusline.log` prints what the statusline saw, including whether it asked for a refresh (`refresh=1`) and why.
+- Cache fine but nothing renders — it may be older than `CS_USAGE_MAX_AGE`. Turn the log on to see what the statusline actually saw, including whether it asked for a refresh:
+
+```bash
+CS_STATUSLINE_LOG=1 ~/.claude/plugins/.../statusline.sh < /dev/null   # or export it for a session
+grep "Usage cache" statusline.log | tail
+```
 
 ---
 
